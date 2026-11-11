@@ -15,21 +15,31 @@ import time
 import math
 import random
 import datetime
+import urllib.request
 import threading
 import asyncio
 import winreg
+import sqlite3
+import shutil
+import tempfile
+import xml.etree.ElementTree as ET
 from collections import deque
 
 import psutil
 import requests
 import re
+import traceback
+import subprocess
+import ctypes
 from PySide6.QtCore import (Qt, QTimer, QRect, QRectF, QPoint, QPointF, QPropertyAnimation,
                             QVariantAnimation, QEasingCurve, Signal, QObject)
 from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPen, QFont, QPixmap, QImage,
-                           QConicalGradient, QLinearGradient, QIcon, QTransform, QBrush, QRegion)
+                           QConicalGradient, QLinearGradient, QRadialGradient, QCursor,
+                           QIcon, QTransform, QBrush, QRegion, QFontMetrics)
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QHBoxLayout,
                                QVBoxLayout, QStackedWidget, QMenu, QLayout,
-                               QGraphicsOpacityEffect, QSizePolicy, QSystemTrayIcon)
+                               QGraphicsOpacityEffect, QSizePolicy, QSystemTrayIcon, QFrame,
+                               QLineEdit, QComboBox, QScrollArea, QSpacerItem)
 
 try:
     import winsound
@@ -54,6 +64,8 @@ METHODS = [(None, "Automatic"), (21, "Morocco"), (3, "Muslim World League"),
            (1, "Karachi"), (12, "France (UOIF)"), (13, "Turkey (Diyanet)"), (19, "Algeria"),
            (18, "Tunisia"), (8, "Gulf Region"), (9, "Kuwait"), (10, "Qatar"), (16, "Dubai")]
 WIDGETS = {"media": ("Universal Media Player", "Controls Spotify, YouTube, Apple Music & browsers", "#30d158", "music"),
+           "notification": ("Notification Center", "System and app notification alerts", "#0a84ff", "bell"),
+           "weather": ("Immersive Weather", "Live weather, daylight bar & 6-day forecast", "#56aeff", "cloud"),
            "prayer": ("Prayer Times", "Next prayer, countdown and reminders", "#30d158", "moon"),
            "pomodoro": ("Pomodoro", "Focus timer with breaks", "#ff453a", "timer"),
            "football": ("Football", "Live scores with team logos", "#0a84ff", "ball"),
@@ -63,6 +75,11 @@ DEFAULTS = {
     "widgets": [{"id": k, "on": True} for k in WIDGETS],
     "media_ambient_glow": True,
     "media_progress_style": "classic",  # "classic", "wavy", "soundwave"
+    "lyrics_enabled": True, "lyrics_layout": 0, "lyrics_click_seek": True,
+    "eyes_tracking": True, "eyes_reactions": True, "eyes_idle_delay": 4,
+    "privacy_alerts": True, "privacy_toast_duration": 4,
+    "weather_unit": 0, "weather_dynamic_gradient": True,
+    "notifications_enabled": True, "notifications_show_badge": True, "notifications_history_limit": 1,
     "city": "", "country": "", "method": None,
     "prayer_reminders": True, "remind_minutes": 5, "notify_at_time": True, "sound": True,
     "focus_min": 25, "short_min": 5, "long_min": 15, "long_every": 4, "pomo_sound": True,
@@ -71,6 +88,7 @@ DEFAULTS = {
     "todos": {str(d): [] for d in range(7)}, "todo_repeat": True, "todo_in_pill": True,
     "disk": "C:\\" if os.name == "nt" else "/",
     "shrink_idle": True, "idle_seconds": 5, "size": 1, "start_with_windows": False,
+    "theme": "dark",
 }
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Island")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
@@ -101,9 +119,9 @@ def save_config():
 CFG = load_config()
 
 ROTATE_SECONDS = 8
-COLLAPSED = (270, 34)
+COLLAPSED = (140, 32)
 TINY = (140, 10)                                      # the thin line the island shrinks to when idle
-EXPANDED_SIZES = [(460, 158), (500, 158), (560, 168)]  # Compact, Regular, Large
+EXPANDED_SIZES = [(480, 158), (540, 158), (580, 168)]  # Compact, Regular, Large
 
 # Apple system colours (dark mode)
 RED, GREEN, BLUE = "#ff453a", "#30d158", "#0a84ff"
@@ -125,8 +143,21 @@ QMenu::item:selected {{ background: {BLUE}; }}
 """
 
 
+def _parse_color(c):
+    if isinstance(c, QColor):
+        return c
+    if isinstance(c, str) and c.startswith("rgba"):
+        try:
+            parts = [float(x.strip()) for x in c[c.find("(")+1 : c.find(")")].split(",")]
+            return QColor(int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+        except Exception:
+            pass
+    col = QColor(c)
+    return col if col.isValid() else QColor(255, 255, 255, 255)
+
+
 def blend(a, b, t):
-    a, b = QColor(a), QColor(b)
+    a, b = _parse_color(a), _parse_color(b)
     mix = lambda x, y: int(x + (y - x) * t)
     return QColor(mix(a.red(), b.red()), mix(a.green(), b.green()),
                   mix(a.blue(), b.blue()), mix(a.alpha(), b.alpha()))
@@ -191,6 +222,14 @@ def draw_icon(p, name, rect, color):
         a = s * 0.1
         p.drawLine(tip, QPointF(tip.x() - a, tip.y() - a))
         p.drawLine(tip, QPointF(tip.x() - a, tip.y() + a))
+    elif name in ("sidebar.left", "sidebar"):
+        wb, hb = s * 0.72, s * 0.54
+        rb = QRectF(c.x() - wb / 2, c.y() - hb / 2, wb, hb)
+        p.setPen(QPen(color, max(1.4, s * 0.08), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rb, 2.5, 2.5)
+        dx = rb.left() + wb * 0.34
+        p.drawLine(QPointF(dx, rb.top()), QPointF(dx, rb.bottom()))
     elif name in ("left", "right"):
         d = s * 0.11 * (1 if name == "left" else -1)
         p.setPen(line)
@@ -235,6 +274,14 @@ def draw_icon(p, name, rect, color):
         p.setPen(Qt.NoPen)
         p.setBrush(color)
         p.drawPath(full.subtracted(bite))
+    elif name == "cloud":
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        r = s * 0.18
+        p.drawEllipse(QPointF(c.x() - r * 0.7, c.y() + r * 0.1), r * 0.8, r * 0.8)
+        p.drawEllipse(QPointF(c.x() + r * 0.1, c.y() - r * 0.3), r * 1.1, r * 1.1)
+        p.drawEllipse(QPointF(c.x() + r * 0.9, c.y() + r * 0.1), r * 0.7, r * 0.7)
+        p.drawRoundedRect(QRectF(c.x() - r * 1.3, c.y() - r * 0.1, r * 2.8, r * 1.2), r * 0.6, r * 0.6)
     elif name == "timer":
         r = s * 0.25
         p.setPen(line)
@@ -479,11 +526,21 @@ class AppleButton(QPushButton):
             bg = blend(self.color, self.color.lighter(125), self.hover)
             icon_color = QColor("white")
         elif self.kind == "ghost":
-            bg = blend(QColor(44, 44, 46, 0), QColor(FILL), self.hover)
-            icon_color = blend("#a0ffffff", "#ffffff", self.hover)
+            is_light = getattr(self.window(), "theme", "dark") == "light"
+            if is_light:
+                bg = QColor(0, 0, 0, int(15 * self.hover))
+                icon_color = blend(QColor(0, 0, 0, 185), QColor(0, 0, 0, 255), self.hover)
+            else:
+                bg = QColor(255, 255, 255, int(35 * self.hover))
+                icon_color = blend(QColor(255, 255, 255, 185), QColor(255, 255, 255, 255), self.hover)
         else:
-            bg = blend(FILL, FILL_HI, self.hover)
-            icon_color = QColor("white")
+            is_light = getattr(self.window(), "theme", "dark") == "light"
+            if is_light:
+                bg = blend("#E5E5EA", "#D8D8DC", self.hover)
+                icon_color = QColor("#1D1D1F")
+            else:
+                bg = blend(FILL, FILL_HI, self.hover)
+                icon_color = QColor("white")
         p.setPen(Qt.NoPen)
         p.setBrush(bg)
         p.drawEllipse(r)
@@ -497,12 +554,13 @@ class AppleButton(QPushButton):
 
 
 class Segmented(QWidget):
-    """iOS segmented control with a sliding thumb."""
+    """iOS / macOS segmented control with a sliding thumb."""
     changed = Signal(int)
 
-    def __init__(self, labels, width=210, track="#1c1c1e"):
+    def __init__(self, labels, width=210, track=None):
         super().__init__()
-        self.labels, self.track = labels, QColor(track)
+        self.labels = labels
+        self.track_custom = QColor(track) if track and track not in ("#1c1c1e", "#2c2c2e") else None
         self.index, self.pos = 0, 0.0
         self.setFixedSize(width, 28)
         self.setCursor(Qt.PointingHandCursor)
@@ -525,20 +583,35 @@ class Segmented(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        is_light = getattr(self.window(), "theme", "dark") == "light"
         w, h, n = self.width(), self.height(), len(self.labels)
+
+        # Track: #2C2C2E in Dark, #E5E5EA in Light
+        track_color = self.track_custom or (QColor("#E5E5EA") if is_light else QColor("#2C2C2E"))
         p.setPen(Qt.NoPen)
-        p.setBrush(self.track)
+        p.setBrush(track_color)
         p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
+
+        # Thumb: #636366 (text #FFFFFF) in Dark, #FFFFFF (text #1D1D1F, border 1px solid rgba(0,0,0,0.08)) in Light
         seg = (w - 4) / n
         thumb = QRectF(2 + self.pos * seg, 2, seg, h - 4)
-        p.setBrush(QColor("#5a5a5e") if self.track == QColor("#2c2c2e") else QColor("#48484a"))
-        p.drawRoundedRect(thumb, (h - 4) / 2, (h - 4) / 2)
+        if is_light:
+            p.setPen(QPen(QColor(0, 0, 0, 20), 1))
+            p.setBrush(QColor("#FFFFFF"))
+            p.drawRoundedRect(thumb.adjusted(0.5, 0.5, -0.5, -0.5), (h - 4) / 2, (h - 4) / 2)
+        else:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#636366"))
+            p.drawRoundedRect(thumb, (h - 4) / 2, (h - 4) / 2)
+
         f = QFont("Segoe UI", 9)
         f.setWeight(QFont.DemiBold)
         p.setFont(f)
+        sel_col = "#1D1D1F" if is_light else "#FFFFFF"
+        unsel_col = "#6E6E73" if is_light else "#8E8E93"
         for i, label in enumerate(self.labels):
             t = max(0.0, 1 - abs(self.pos - i))
-            p.setPen(blend(MUTED, "#ffffff", t))
+            p.setPen(blend(unsel_col, sel_col, t))
             p.drawText(QRectF(2 + i * seg, 0, seg, h), Qt.AlignCenter, label)
 
 
@@ -1242,75 +1315,248 @@ class SystemPage(QWidget):
 
 
 # ======================= hardware monitor (camera / mic / charger) =======================
-def _check_device_in_use(device_type):
-    """Check if camera or microphone is currently in use via Windows registry.
-    device_type: 'webcam' or 'microphone'"""
-    base = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{device_type}"
+def check_windows_consent(device_name):
+    """Windows ConsentStore probe for camera ('webcam') and microphone ('microphone').
+    Checks direct subkeys (UWP apps) and NonPackaged subkeys (desktop apps: Brave, Chrome, etc.).
+    A device is actively in use whenever LastUsedTimeStop == 0 and LastUsedTimeStart > 0."""
+    active_apps = []
+    base_key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{device_name}"
+
     try:
-        for root_path in (base, base + r"\NonPackaged"):
-            try:
-                root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, root_path)
-            except OSError:
+        root_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base_key_path, 0, winreg.KEY_READ)
+    except OSError:
+        return active_apps
+
+    # 1. Direct subkeys (UWP apps)
+    i = 0
+    while True:
+        try:
+            subkey_name = winreg.EnumKey(root_key, i)
+            i += 1
+            if subkey_name.lower() == "nonpackaged":
                 continue
-            i = 0
-            while True:
+            try:
+                sk = winreg.OpenKey(root_key, subkey_name, 0, winreg.KEY_READ)
                 try:
-                    subkey_name = winreg.EnumKey(root, i)
-                    i += 1
-                except OSError:
-                    break
-                try:
-                    sk = winreg.OpenKey(root, subkey_name)
                     start, _ = winreg.QueryValueEx(sk, "LastUsedTimeStart")
                     stop, _ = winreg.QueryValueEx(sk, "LastUsedTimeStop")
-                    winreg.CloseKey(sk)
                     if start > 0 and stop == 0:
-                        winreg.CloseKey(root)
-                        return True
+                        clean = subkey_name.split("_")[0].split(".")[-1]
+                        if clean.lower() == "windowscamera":
+                            clean = "Camera"
+                        elif clean.lower() == "immersivecontrolpanel":
+                            clean = "Settings"
+                        clean = clean.capitalize()
+                        if clean not in active_apps:
+                            active_apps.append(clean)
+                finally:
+                    winreg.CloseKey(sk)
+            except OSError:
+                pass
+        except OSError:
+            break
+
+    # 2. NonPackaged subkeys (Win32 apps: Brave, Chrome, Firefox, Edge, Discord, Zoom, OBS...)
+    try:
+        np_key = winreg.OpenKey(root_key, "NonPackaged", 0, winreg.KEY_READ)
+        j = 0
+        while True:
+            try:
+                np_subkey = winreg.EnumKey(np_key, j)
+                j += 1
+                try:
+                    sk = winreg.OpenKey(np_key, np_subkey, 0, winreg.KEY_READ)
+                    try:
+                        start, _ = winreg.QueryValueEx(sk, "LastUsedTimeStart")
+                        stop, _ = winreg.QueryValueEx(sk, "LastUsedTimeStop")
+                        if start > 0 and stop == 0:
+                            exe_part = re.split(r"[#/\\]", np_subkey)[-1]
+                            raw_name = exe_part[:-4] if exe_part.lower().endswith(".exe") else exe_part
+                            low = raw_name.lower()
+                            if low == "brave":
+                                friendly = "Brave"
+                            elif low == "chrome":
+                                friendly = "Chrome"
+                            elif low in ("msedge", "edge"):
+                                friendly = "Edge"
+                            elif low == "firefox":
+                                friendly = "Firefox"
+                            elif "discord" in low:
+                                friendly = "Discord"
+                            elif "zoom" in low:
+                                friendly = "Zoom"
+                            elif "obs" in low:
+                                friendly = "OBS"
+                            else:
+                                friendly = raw_name.capitalize()
+                            if friendly not in active_apps:
+                                active_apps.append(friendly)
+                    finally:
+                        winreg.CloseKey(sk)
                 except OSError:
                     pass
-            winreg.CloseKey(root)
+            except OSError:
+                break
+        winreg.CloseKey(np_key)
+    except OSError:
+        pass
+
+    winreg.CloseKey(root_key)
+    return active_apps
+
+
+def check_linux_privacy():
+    """Linux privacy check: /dev/video* file descriptors for camera, pactl for microphone."""
+    cam_apps = []
+    mic_apps = []
+
+    # Camera via /proc/[0-9]*/fd/* (never psutil.open_files!)
+    try:
+        import glob
+        for fd_path in glob.glob("/proc/[0-9]*/fd/*"):
+            try:
+                target = os.readlink(fd_path)
+                if "/dev/video" in target:
+                    pid = fd_path.split("/")[2]
+                    comm_path = f"/proc/{pid}/comm"
+                    app_name = "Camera"
+                    if os.path.exists(comm_path):
+                        with open(comm_path, "r", errors="ignore") as f:
+                            app_name = f.read().strip()
+                    if app_name in ("pipewire", "wireplumber") or "--type=utility" in app_name:
+                        cmd_path = f"/proc/{pid}/cmdline"
+                        if os.path.exists(cmd_path):
+                            with open(cmd_path, "r", errors="ignore") as f:
+                                cmd = f.read()
+                                if "brave" in cmd.lower():
+                                    app_name = "Brave"
+                                elif "chrome" in cmd.lower():
+                                    app_name = "Chrome"
+                                elif "firefox" in cmd.lower():
+                                    app_name = "Firefox"
+                    clean = app_name.capitalize()
+                    if clean not in cam_apps:
+                        cam_apps.append(clean)
+            except OSError:
+                pass
     except Exception:
         pass
-    return False
+
+    # Microphone via pactl list source-outputs
+    try:
+        import subprocess
+        out = subprocess.check_output(["pactl", "list", "source-outputs"], stderr=subprocess.DEVNULL, text=True)
+        for line in out.splitlines():
+            line_s = line.strip()
+            if "application.name = " in line_s:
+                cur_app = line_s.split("=")[-1].strip(' "')
+                if cur_app and cur_app not in mic_apps and "peak" not in cur_app.lower():
+                    mic_apps.append(cur_app.capitalize())
+    except Exception:
+        pass
+
+    return cam_apps, mic_apps
+
+
+def _check_hardware_privacy():
+    if sys.platform == "win32":
+        return check_windows_consent("webcam"), check_windows_consent("microphone")
+    elif sys.platform.startswith("linux"):
+        return check_linux_privacy()
+    return [], []
 
 
 class HardwareMonitor(QObject):
-    """Polls camera, mic and charger state every 2 s and emits signals on change."""
+    """Non-blocking background hardware privacy monitor for camera, mic, and battery.
+    Polls every 1.5s in a daemon thread so the UI never freezes.
+    Emits:
+      - privacy_alert(dict): Stage 1 on-trigger live alert banner
+      - privacy_state(dict): Stage 2 persistent header pill
+      - camera_changed(bool)
+      - mic_changed(bool)
+      - charger_changed(bool, int)
+    """
     camera_changed = Signal(bool)
     mic_changed = Signal(bool)
-    charger_changed = Signal(bool, int)   # (plugged_in, battery_percent)
+    charger_changed = Signal(bool, int)
+    privacy_alert = Signal(dict)
+    privacy_state = Signal(dict)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._camera = False
         self._mic = False
-        self._plugged = None   # None = unknown initial state
-        self._timer = QTimer(self)
-        self._timer.setInterval(2000)
-        self._timer.timeout.connect(self._poll)
-        self._timer.start()
-        self._poll()           # first sample immediately
+        self._cam_apps = []
+        self._mic_apps = []
+        self._prev_cam_set = set()
+        self._prev_mic_set = set()
+        self._plugged = None
+        self._running = True
 
-    def _poll(self):
-        cam = _check_device_in_use("webcam")
-        mic = _check_device_in_use("microphone")
-        if cam != self._camera:
-            self._camera = cam
-            self.camera_changed.emit(cam)
-        if mic != self._mic:
-            self._mic = mic
-            self.mic_changed.emit(mic)
-        try:
-            bat = psutil.sensors_battery()
-        except Exception:
-            bat = None
-        if bat:
-            plugged = bat.power_plugged
-            pct = int(bat.percent)
-            if self._plugged is not None and plugged != self._plugged:
-                self.charger_changed.emit(plugged, pct)
-            self._plugged = plugged
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _worker_loop(self):
+        time.sleep(0.5)
+        while self._running:
+            try:
+                cam_apps, mic_apps = _check_hardware_privacy()
+                cam_set = set(cam_apps)
+                mic_set = set(mic_apps)
+                cam_active = bool(cam_set)
+                mic_active = bool(mic_set)
+
+                # Transition detection for Stage 1 Toast Alert Banner
+                new_cam = cam_set - self._prev_cam_set
+                new_mic = mic_set - self._prev_mic_set
+
+                if new_cam or new_mic:
+                    self.privacy_alert.emit({
+                        "has_cam": bool(new_cam),
+                        "has_mic": bool(new_mic),
+                        "cam_apps": list(cam_set),
+                        "mic_apps": list(mic_set),
+                        "new_cam_apps": list(new_cam),
+                        "new_mic_apps": list(new_mic),
+                    })
+
+                # State change detection for Stage 2 Persistent Header Pill
+                if cam_set != self._prev_cam_set or mic_set != self._prev_mic_set:
+                    self._prev_cam_set = cam_set
+                    self._prev_mic_set = mic_set
+                    self._cam_apps = cam_apps
+                    self._mic_apps = mic_apps
+                    self.privacy_state.emit({
+                        "camera_active": cam_active,
+                        "mic_active": mic_active,
+                        "cam_apps": list(cam_set),
+                        "mic_apps": list(mic_set),
+                    })
+
+                if cam_active != self._camera:
+                    self._camera = cam_active
+                    self.camera_changed.emit(cam_active)
+
+                if mic_active != self._mic:
+                    self._mic = mic_active
+                    self.mic_changed.emit(mic_active)
+
+                try:
+                    bat = psutil.sensors_battery()
+                except Exception:
+                    bat = None
+                if bat:
+                    plugged = bat.power_plugged
+                    pct = int(bat.percent)
+                    if self._plugged is not None and plugged != self._plugged:
+                        self.charger_changed.emit(plugged, pct)
+                    self._plugged = plugged
+            except Exception:
+                pass
+            time.sleep(1.5)
 
     @property
     def camera(self):
@@ -1319,6 +1565,11 @@ class HardwareMonitor(QObject):
     @property
     def mic(self):
         return self._mic
+
+
+def _check_device_in_use(device_type):
+    cam, mic = _check_hardware_privacy()
+    return bool(cam) if device_type == "webcam" else bool(mic)
 
 
 # ======================= Universal Media Player Tab =======================
@@ -1458,6 +1709,537 @@ class WindowsMediaListener(QObject):
                 self._mgr = None
 
             await asyncio.sleep(1.0)
+
+
+# ======================= Apple Dynamic Island Privacy Alert & Indicator System =======================
+def draw_apple_video_fill(p, rect, color):
+    """Apple SF-Style video.fill vector icon: rounded camera body + right-facing lens triangle."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    body_w = w * 0.68
+    body_h = h * 0.72
+    body_y = y + (h - body_h) / 2.0
+
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(x, body_y, body_w, body_h), 2.2, 2.2)
+
+    lens_x = x + body_w - 0.5
+    top_y = y + h * 0.22
+    bot_y = y + h * 0.78
+    mid_top_y = y + h * 0.36
+    mid_bot_y = y + h * 0.64
+
+    lens = QPainterPath()
+    lens.moveTo(lens_x, mid_top_y)
+    lens.lineTo(x + w, top_y)
+    lens.lineTo(x + w, bot_y)
+    lens.lineTo(lens_x, mid_bot_y)
+    lens.closeSubpath()
+    path.addPath(lens)
+
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawPath(path)
+    p.restore()
+
+
+def draw_apple_mic_fill(p, rect, color):
+    """Apple SF-Style mic.fill vector icon: capsule microphone head resting in a U-cradle with base stem."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    cx = x + w / 2.0
+
+    cap_w = w * 0.38
+    cap_h = h * 0.52
+    cap_x = cx - cap_w / 2.0
+    cap_y = y + 0.5
+
+    capsule = QPainterPath()
+    capsule.addRoundedRect(QRectF(cap_x, cap_y, cap_w, cap_h), cap_w / 2.0, cap_w / 2.0)
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawPath(capsule)
+
+    cradle_w = w * 0.66
+    cradle_x = cx - cradle_w / 2.0
+    cradle_top = y + cap_h * 0.45
+    cradle_bot = y + cap_h + 2.0
+
+    cradle = QPainterPath()
+    cradle.moveTo(cradle_x, cradle_top)
+    cradle.quadTo(cradle_x, cradle_bot, cx, cradle_bot)
+    cradle.quadTo(cradle_x + cradle_w, cradle_bot, cradle_x + cradle_w, cradle_top)
+
+    pen = QPen(color, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(cradle)
+
+    stem_bot = y + h - 1.0
+    p.drawLine(QPointF(cx, cradle_bot), QPointF(cx, stem_bot))
+    base_w = w * 0.44
+    p.drawLine(QPointF(cx - base_w / 2.0, stem_bot), QPointF(cx + base_w / 2.0, stem_bot))
+    p.restore()
+
+
+class HardwarePrivacyMonitor(QObject):
+    """Non-blocking background hardware privacy monitor for camera & microphone.
+    Polls every 1.5s in a daemon thread.
+    Emits:
+      - privacy_alert(dict): on idle -> active transition (triggers Stage 1 Alert Banner)
+      - privacy_state(dict): on any hardware state change (updates Stage 2 Persistent Pill)
+    """
+    privacy_alert = Signal(dict)
+    privacy_state = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self._prev_cam_apps = set()
+        self._prev_mic_apps = set()
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _worker_loop(self):
+        time.sleep(1.0)
+        while self._running:
+            try:
+                cam_apps, mic_apps = self._check_hardware()
+                cam_set = set(cam_apps)
+                mic_set = set(mic_apps)
+
+                # Newly activated apps/devices
+                new_cam = cam_set - self._prev_cam_apps
+                new_mic = mic_set - self._prev_mic_apps
+
+                if new_cam or new_mic:
+                    alert_info = {
+                        "has_cam": bool(new_cam),
+                        "has_mic": bool(new_mic),
+                        "cam_apps": list(cam_set),
+                        "mic_apps": list(mic_set),
+                        "new_cam_apps": list(new_cam),
+                        "new_mic_apps": list(new_mic),
+                    }
+                    self.privacy_alert.emit(alert_info)
+
+                if cam_set != self._prev_cam_apps or mic_set != self._prev_mic_apps:
+                    self._prev_cam_apps = cam_set
+                    self._prev_mic_apps = mic_set
+                    state_info = {
+                        "camera_active": bool(cam_set),
+                        "mic_active": bool(mic_set),
+                        "cam_apps": list(cam_set),
+                        "mic_apps": list(mic_set),
+                    }
+                    self.privacy_state.emit(state_info)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+    def _check_hardware(self):
+        cam_apps = []
+        mic_apps = []
+
+        if sys.platform == "win32":
+            import winreg
+            for hkey in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for dev, target_list in [("webcam", cam_apps), ("microphone", mic_apps)]:
+                    base_path = f"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\{dev}"
+                    try:
+                        root = winreg.OpenKey(hkey, base_path, 0, winreg.KEY_READ)
+                    except Exception:
+                        continue
+
+                    # NonPackaged Win32 apps (Chrome, Zoom, Discord, OBS...)
+                    try:
+                        np = winreg.OpenKey(root, "NonPackaged", 0, winreg.KEY_READ)
+                        i = 0
+                        while True:
+                            sub = winreg.EnumKey(np, i)
+                            i += 1
+                            try:
+                                k = winreg.OpenKey(np, sub, 0, winreg.KEY_READ)
+                                stop, _ = winreg.QueryValueEx(k, "LastUsedTimeStop")
+                                start, _ = winreg.QueryValueEx(k, "LastUsedTimeStart")
+                                if stop == 0 or (start > stop and stop > 0):
+                                    raw = sub.split("#")[-1].replace(".exe", "")
+                                    name = "OBS Studio" if "obs" in raw.lower() else raw.capitalize()
+                                    context = self._get_browser_context(name)
+                                    if context not in target_list:
+                                        target_list.append(context)
+                            except Exception:
+                                pass
+                    except OSError:
+                        pass
+
+                    # Packaged UWP apps
+                    try:
+                        i = 0
+                        while True:
+                            sub = winreg.EnumKey(root, i)
+                            i += 1
+                            if sub == "NonPackaged":
+                                continue
+                            try:
+                                k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
+                                stop, _ = winreg.QueryValueEx(k, "LastUsedTimeStop")
+                                start, _ = winreg.QueryValueEx(k, "LastUsedTimeStart")
+                                if stop == 0 or (start > stop and stop > 0):
+                                    name = sub.split("_")[0].split(".")[-1].capitalize()
+                                    if name not in target_list:
+                                        target_list.append(name)
+                            except Exception:
+                                pass
+                    except OSError:
+                        pass
+        return cam_apps, mic_apps
+
+    def _get_browser_context(self, app_name):
+        """Enrich browser process name with meeting/tab context if active."""
+        if app_name.lower() in ("chrome", "msedge", "firefox", "brave"):
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                titles = []
+
+                def enum_cb(hwnd, lparam):
+                    if user32.IsWindowVisible(hwnd):
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buff, length + 1)
+                            val = buff.value
+                            val_l = val.lower()
+                            for kw in ["meet.google.com", "google meet", "zoom", "teams", "discord", "call", "recording"]:
+                                if kw in val_l:
+                                    titles.append(val)
+                                    break
+                    return True
+
+                WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+                if titles:
+                    t = titles[0]
+                    for delim in [" - ", " — ", " | "]:
+                        if delim in t:
+                            return f"{app_name} — {t.split(delim)[0].strip()}"
+                    return f"{app_name} — {t[:16].strip()}"
+            except Exception:
+                pass
+        return app_name
+
+
+class PrivacyAlertBanner(QWidget):
+    """Stage 1: Live Alert Toast Banner (Apple HIG / Dynamic Island).
+    Slides down right below the top header for 4 seconds when recording begins:
+    [🟢 🎥] Brave is using your Camera with a pulsing dot and dismiss action.
+    """
+    dismissed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.has_cam = False
+        self.has_mic = False
+        self.app_name = ""
+        self.pulse = 0.0
+        self.setFixedHeight(0)
+        self.setVisible(False)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to collapse into header pill")
+
+        self.anim = anim(self, 220, self._set_h, QEasingCurve.OutCubic)
+
+        self.dismiss_timer = QTimer(self)
+        self.dismiss_timer.setSingleShot(True)
+        self.dismiss_timer.setInterval(4000)
+        self.dismiss_timer.timeout.connect(self.hide_banner)
+
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(40)
+        self.pulse_timer.timeout.connect(self._step_pulse)
+        self._pulse_dir = 1
+
+    def _step_pulse(self):
+        self.pulse += 0.05 * self._pulse_dir
+        if self.pulse >= 1.0:
+            self.pulse = 1.0
+            self._pulse_dir = -1
+        elif self.pulse <= 0.0:
+            self.pulse = 0.0
+            self._pulse_dir = 1
+        self.update()
+
+    def _set_h(self, v):
+        self.setFixedHeight(int(v))
+        if v <= 0:
+            self.setVisible(False)
+            self.pulse_timer.stop()
+
+    def trigger_alert(self, info):
+        self.has_cam = info.get("has_cam", False) or bool(info.get("cam_apps"))
+        self.has_mic = info.get("has_mic", False) or bool(info.get("mic_apps"))
+        apps = info.get("new_cam_apps") or info.get("new_mic_apps") or info.get("cam_apps") or info.get("mic_apps") or ["An app"]
+        self.app_name = apps[0]
+
+        self.setVisible(True)
+        self.pulse_timer.start()
+        self.dismiss_timer.start()
+        run_anim(self.anim, self.height(), 36)
+        self.update()
+
+    def hide_banner(self):
+        self.dismiss_timer.stop()
+        run_anim(self.anim, self.height(), 0)
+        self.dismissed.emit()
+
+    def mousePressEvent(self, e):
+        self.hide_banner()
+        super().mousePressEvent(e)
+
+    def paintEvent(self, _):
+        if self.height() <= 2:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        w, h = self.width(), self.height()
+        r = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+
+        # Semantic privacy styling: Camera takes precedence for green theme, otherwise mic orange
+        if self.has_cam:
+            pri_color = QColor("#30D158")
+            bg_color = QColor(48, 209, 88, 46)
+            border_color = QColor("#30D158")
+            dev_str = "Camera & Mic" if self.has_mic else "Camera"
+        else:
+            pri_color = QColor("#FF9F0A")
+            bg_color = QColor(255, 159, 10, 46)
+            border_color = QColor("#FF9F0A")
+            dev_str = "Microphone"
+
+        p.setPen(QPen(border_color, 1.0))
+        p.setBrush(bg_color)
+        p.drawRoundedRect(r, 12, 12)
+
+        x = 12.0
+        cy = h / 2.0
+
+        # Pulsing privacy dot
+        dot_r = 3.5 + 1.2 * self.pulse
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(pri_color.red(), pri_color.green(), pri_color.blue(), int(60 + 80 * self.pulse)))
+        p.drawEllipse(QPointF(x + 4, cy), dot_r + 2.0, dot_r + 2.0)
+        p.setBrush(pri_color)
+        p.drawEllipse(QPointF(x + 4, cy), 3.5, 3.5)
+        x += 16.0
+
+        # Apple vector icon(s)
+        if self.has_cam:
+            draw_apple_video_fill(p, QRectF(x, cy - 7, 14, 14), pri_color)
+            x += 18.0
+        if self.has_mic:
+            draw_apple_mic_fill(p, QRectF(x, cy - 7, 14, 14), QColor("#FF9F0A") if self.has_cam else pri_color)
+            x += 18.0
+
+        # High-contrast label: "{App} is using your Camera"
+        text = f"{self.app_name} is using your {dev_str}"
+        p.setPen(QColor(255, 255, 255, 245))
+        f = QFont("Segoe UI", 10)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        avail_w = w - x - 26.0
+        fm = p.fontMetrics()
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, int(avail_w))
+        p.drawText(QRectF(x, 0, avail_w, h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
+
+        # Right dismiss icon
+        p.setPen(QColor(255, 255, 255, 125))
+        f_close = QFont("Segoe UI", 10)
+        p.setFont(f_close)
+        p.drawText(QRectF(w - 22, 0, 16, h), Qt.AlignmentFlag.AlignCenter, "✕")
+
+
+class PrivacyPillWidget(QWidget):
+    """Stage 2: Persistent Header Privacy Pill (Apple HIG & @ui-ux-pro-max).
+    Directly mounted inside the Top Header Bar layout immediately to the left of the clock:
+    [🎥 Brave] and/or [🎙️ Brave]
+    Clicking or hovering expands details of active apps.
+    """
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.camera_active = False
+        self.mic_active = False
+        self.cam_apps = []
+        self.mic_apps = []
+        self.hover = 0.0
+        self.pulse = 0.0
+        self.setFixedHeight(22)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setVisible(False)
+
+        self.hover_anim = anim(self, 140, self._set_hover)
+
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(50)
+        self.pulse_timer.timeout.connect(self._step_pulse)
+        self._pulse_dir = 1
+
+    def _step_pulse(self):
+        self.pulse += 0.04 * self._pulse_dir
+        if self.pulse >= 1.0:
+            self.pulse = 1.0
+            self._pulse_dir = -1
+        elif self.pulse <= 0.0:
+            self.pulse = 0.0
+            self._pulse_dir = 1
+        self.update()
+
+    def _set_hover(self, v):
+        self.hover = float(v)
+        self.update()
+
+    def enterEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 1)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 0)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+    def set_state(self, info):
+        self.camera_active = info.get("camera_active", False)
+        self.mic_active = info.get("mic_active", False)
+        self.cam_apps = info.get("cam_apps", [])
+        self.mic_apps = info.get("mic_apps", [])
+
+        is_active = self.camera_active or self.mic_active
+        self.setVisible(is_active)
+        if is_active:
+            if not self.pulse_timer.isActive():
+                self.pulse_timer.start()
+            label = self._short_label()
+            w = 28
+            if self.camera_active and self.mic_active:
+                w += 15
+            if label:
+                f = QFont("Segoe UI", 9)
+                f.setWeight(QFont.Weight.Bold)
+                fm = QFontMetrics(f)
+                w += fm.horizontalAdvance(label) + 8
+            self.setFixedWidth(max(34, w))
+
+            tip_lines = ["🔒 Hardware Privacy Active:"]
+            if self.camera_active:
+                apps_s = ", ".join(self.cam_apps) if self.cam_apps else "Active"
+                tip_lines.append(f"🟢 Camera in use by: {apps_s}")
+            if self.mic_active:
+                apps_s = ", ".join(self.mic_apps) if self.mic_apps else "Active"
+                tip_lines.append(f"🟠 Microphone in use by: {apps_s}")
+            tip_lines.append("Click to toggle details")
+            self.setToolTip("\n".join(tip_lines))
+        else:
+            self.pulse_timer.stop()
+        self.update()
+
+    def _short_label(self):
+        apps = self.cam_apps or self.mic_apps
+        if not apps:
+            return ""
+        first = apps[0]
+        if "—" in first:
+            return first.split("—")[-1].strip()[:10]
+        return first[:8]
+
+    def paintEvent(self, _):
+        if not (self.camera_active or self.mic_active):
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        w, h = self.width(), self.height()
+        r = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        cy = h / 2.0
+
+        if self.camera_active:
+            pri = QColor("#30D158")
+            bg = QColor(48, 209, 88, int(46 + 20 * self.hover))
+            border = QColor("#30D158")
+        else:
+            pri = QColor("#FF9F0A")
+            bg = QColor(255, 159, 10, int(46 + 20 * self.hover))
+            border = QColor("#FF9F0A")
+
+        p.setPen(QPen(border, 1.0))
+        p.setBrush(bg)
+        p.drawRoundedRect(r, 11, 11)
+
+        x = 7.0
+        if self.camera_active:
+            draw_apple_video_fill(p, QRectF(x, cy - 6, 12, 12), QColor("#30D158"))
+            x += 15.0
+        if self.mic_active:
+            draw_apple_mic_fill(p, QRectF(x, cy - 6, 12, 12), QColor("#FF9F0A"))
+            x += 15.0
+
+        dot_r = 3.0 + 0.8 * self.pulse
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(pri.red(), pri.green(), pri.blue(), int(80 + 90 * self.pulse)))
+        p.drawEllipse(QPointF(x + 2, cy), dot_r + 1.5, dot_r + 1.5)
+        p.setBrush(pri)
+        p.drawEllipse(QPointF(x + 2, cy), 2.8, 2.8)
+        x += 9.0
+
+        lbl = self._short_label()
+        if lbl and (w - x) >= 20:
+            f = QFont("Segoe UI", 9)
+            f.setWeight(QFont.Weight.Bold)
+            p.setFont(f)
+            p.setPen(pri)
+            p.drawText(QRectF(x, 0, w - x - 4, h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lbl)
+
+
+# Backwards compatibility alias
+PrivacyHeaderPill = PrivacyPillWidget
+
+
+class MiniPrivacyDot(QWidget):
+    """Dynamic Island collapsed notch glowing privacy dot (7px)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(14, 14)
+        self.color = None
+        self.setVisible(False)
+
+    def set_color(self, color):
+        self.color = color
+        self.setVisible(color is not None)
+        self.update()
+
+    def paintEvent(self, _):
+        if not self.color:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        halo = QColor(self.color)
+        halo.setAlpha(80)
+        p.setBrush(halo)
+        p.drawEllipse(QPointF(7, 7), 6, 6)
+        p.setBrush(self.color)
+        p.drawEllipse(QPointF(7, 7), 3.5, 3.5)
 
 
 def extract_palette_from_image(qimage):
@@ -3053,39 +3835,82 @@ def set_startup(on):
         pass
 
 
-def dark_title_bar(widget):
+def dark_title_bar(widget, dark=True):
     if os.name != "nt":
         return
     try:
         import ctypes
-        value = ctypes.c_int(1)
+        value = ctypes.c_int(1 if dark else 0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(int(widget.winId()), 20,
                                                    ctypes.byref(value), ctypes.sizeof(value))
     except Exception:
         pass
 
 
-SETTINGS_STYLE = f"""
-QWidget {{ color: white; font-family: 'Segoe UI'; font-size: 13px; }}
-QWidget#root, QWidget#detail, QWidget#sidebar {{ background: #000000; }}
+def get_settings_stylesheet(theme="dark"):
+    if theme == "light":
+        return f"""
+QWidget {{ color: #1D1D1F; font-family: 'Segoe UI'; font-size: 13px; }}
+QWidget#root {{ background: #F5F5F7; }}
+QWidget#sidebar {{ background: #F2F2F7; }}
+QWidget#detail {{ background: #F5F5F7; }}
+QScrollArea {{ border: none; background: transparent; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QScrollBar:vertical {{ width: 8px; background: transparent; margin: 4px 0; }}
+QScrollBar::handle:vertical {{ background: #C7C7CC; border-radius: 4px; min-height: 30px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QLabel {{ background: transparent; color: #1D1D1F; border: none; }}
+QCheckBox {{ border: none; background: transparent; }}
+QFrame#InfoBanner {{ border-radius: 12px; }}
+QFrame#StyleOptionCard {{ border-radius: 14px; }}
+QLabel#muted {{ color: #6E6E73; }}
+QLabel#groupHeader {{ color: #6E6E73; font-size: 12px; font-weight: 600; padding-left: 16px; text-transform: uppercase; }}
+QLabel#groupFooter {{ color: #6E6E73; font-size: 12px; padding: 0 16px; }}
+QLabel#bigTitle {{ font-size: 30px; font-weight: 700; color: #1D1D1F; }}
+QLabel#pageTitle {{ font-size: 15px; font-weight: 700; color: #1D1D1F; }}
+QLineEdit {{ background: transparent; border: none; color: #6E6E73; font-size: 13px;
+             selection-background-color: #007AFF; }}
+QLineEdit:focus {{ color: #1D1D1F; }}
+QComboBox {{ background: transparent; border: none; color: #6E6E73; font-size: 13px; padding-right: 2px; }}
+QComboBox::drop-down {{ border: none; width: 0; }}
+QComboBox QAbstractItemView {{ background: #FFFFFF; color: #1D1D1F; border: 1px solid #D1D1D6;
+                              selection-background-color: #007AFF; outline: 0; padding: 4px; }}
+QPushButton#action {{ background: transparent; border: none; color: #007AFF; text-align: left;
+                      padding: 0 16px; font-size: 13px; min-height: 44px; }}
+QPushButton#action:hover {{ background: rgba(0, 0, 0, 0.05); }}
+QPushButton#danger {{ background: transparent; border: none; color: #FF3B30; text-align: left;
+                      padding: 0 16px; font-size: 13px; min-height: 44px; }}
+QPushButton#danger:hover {{ background: rgba(0, 0, 0, 0.05); }}
+QToolTip {{ color: #1D1D1F; background: #FFFFFF; border: 1px solid #D1D1D6; }}
+"""
+    else:
+        return f"""
+QWidget {{ color: #FFFFFF; font-family: 'Segoe UI'; font-size: 13px; }}
+QWidget#root {{ background: #0B0B0E; }}
+QWidget#sidebar {{ background: #000000; }}
+QWidget#detail {{ background: #0B0B0E; }}
 QScrollArea {{ border: none; background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
 QScrollBar:vertical {{ width: 8px; background: transparent; margin: 4px 0; }}
 QScrollBar::handle:vertical {{ background: #48484a; border-radius: 4px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-QLabel {{ background: transparent; }}
-QLabel#muted {{ color: {MUTED}; }}
-QLabel#groupHeader {{ color: {MUTED}; font-size: 12px; padding-left: 16px; }}
-QLabel#groupFooter {{ color: {MUTED}; font-size: 12px; padding: 0 16px; }}
-QLabel#bigTitle {{ font-size: 30px; font-weight: 700; }}
-QLabel#pageTitle {{ font-size: 15px; font-weight: 700; }}
-QLineEdit {{ background: transparent; border: none; color: {MUTED}; font-size: 13px;
+QLabel {{ background: transparent; color: #FFFFFF; border: none; }}
+QCheckBox {{ border: none; background: transparent; }}
+QFrame#InfoBanner {{ border-radius: 12px; }}
+QFrame#StyleOptionCard {{ border-radius: 14px; }}
+QLabel#muted {{ color: #8E8E93; }}
+QLabel#groupHeader {{ color: #8E8E93; font-size: 12px; font-weight: 600; padding-left: 16px; text-transform: uppercase; }}
+QLabel#groupFooter {{ color: #8E8E93; font-size: 12px; padding: 0 16px; }}
+QLabel#bigTitle {{ font-size: 30px; font-weight: 700; color: #FFFFFF; }}
+QLabel#pageTitle {{ font-size: 15px; font-weight: 700; color: #FFFFFF; }}
+QLineEdit {{ background: transparent; border: none; color: #8E8E93; font-size: 13px;
              selection-background-color: {BLUE}; }}
-QLineEdit:focus {{ color: white; }}
-QComboBox {{ background: transparent; border: none; color: {MUTED}; font-size: 13px; padding-right: 2px; }}
+QLineEdit:focus {{ color: #FFFFFF; }}
+QComboBox {{ background: transparent; border: none; color: #8E8E93; font-size: 13px; padding-right: 2px; }}
 QComboBox::drop-down {{ border: none; width: 0; }}
-QComboBox QAbstractItemView {{ background: #2c2c2e; color: white; border: 1px solid #3a3a3c;
+QComboBox QAbstractItemView {{ background: #2c2c2e; color: #FFFFFF; border: 1px solid #3a3a3c;
                               selection-background-color: {BLUE}; outline: 0; padding: 4px; }}
 QPushButton#action {{ background: transparent; border: none; color: {BLUE}; text-align: left;
                       padding: 0 16px; font-size: 13px; min-height: 44px; }}
@@ -3093,8 +3918,10 @@ QPushButton#action:hover {{ background: #2c2c2e; }}
 QPushButton#danger {{ background: transparent; border: none; color: {RED}; text-align: left;
                       padding: 0 16px; font-size: 13px; min-height: 44px; }}
 QPushButton#danger:hover {{ background: #2c2c2e; }}
-QToolTip {{ color: white; background: #1c1c1e; border: 1px solid #333; }}
+QToolTip {{ color: #FFFFFF; background: #1c1c1e; border: 1px solid #333; }}
 """
+
+SETTINGS_STYLE = get_settings_stylesheet("dark")
 
 
 class IconTile(QWidget):
@@ -3119,25 +3946,31 @@ class IconTile(QWidget):
 
 class AppIcon(QWidget):
     """Island 'app icon' for the profile card: a black pill on a colourful gradient."""
-    def __init__(self, size=58):
+    def __init__(self, size=44):
         super().__init__()
         self.setFixedSize(size, size)
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        s = self.width()
-        grad = QLinearGradient(0, 0, s, s)
+        w = float(self.width())
+        r = w / 2.0
+        grad = QLinearGradient(1, 1, w - 1, w - 1)
         grad.setColorAt(0, QColor("#5e5ce6"))
         grad.setColorAt(0.55, QColor("#bf5af2"))
         grad.setColorAt(1, QColor("#ff375f"))
         p.setPen(Qt.NoPen)
         p.setBrush(grad)
-        p.drawEllipse(QRectF(0, 0, s, s))
+        p.drawEllipse(QRectF(1, 1, w - 2, w - 2))
+
+        notch_w, notch_h = w * (24.0 / 44.0), w * (9.0 / 44.0)
         p.setBrush(QColor("black"))
-        p.drawRoundedRect(QRectF(s * 0.18, s * 0.38, s * 0.64, s * 0.24), s * 0.12, s * 0.12)
+        notch_rect = QRectF(r - notch_w / 2.0, r - notch_h / 2.0, notch_w, notch_h)
+        p.drawRoundedRect(notch_rect, notch_h / 2.0, notch_h / 2.0)
+
         p.setBrush(QColor(GREEN))
-        p.drawEllipse(QPointF(s * 0.7, s * 0.5), s * 0.045, s * 0.045)
+        dot_r = max(1.4, notch_h * 0.18)
+        p.drawEllipse(QPointF(notch_rect.right() - notch_h * 0.45, r), dot_r, dot_r)
 
 
 class Toggle(QWidget):
@@ -3172,11 +4005,14 @@ class Toggle(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         t = max(0.0, min(1.0, self.pos))
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        off_track = "#E5E5EA" if is_light else "#39393d"
+        on_track = "#34C759"
         p.setPen(Qt.NoPen)
-        p.setBrush(blend("#39393d", GREEN, t))
+        p.setBrush(blend(off_track, on_track, t))
         p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
         x = 2 + self.pos * (w - h)
-        p.setBrush(QColor(0, 0, 0, 50))
+        p.setBrush(QColor(0, 0, 0, 35 if is_light else 50))
         p.drawEllipse(QRectF(x, 3, h - 4, h - 4))       # soft knob shadow
         p.setBrush(QColor("white"))
         p.drawEllipse(QRectF(x, 2, h - 4, h - 4))
@@ -3223,6 +4059,7 @@ class Group(QWidget):
     def __init__(self):
         super().__init__()
         self.rows = []
+        self.is_profile = False
         self.box = QVBoxLayout(self)
         self.box.setContentsMargins(0, 0, 0, 0)
         self.box.setSpacing(0)
@@ -3235,13 +4072,21 @@ class Group(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#1c1c1e"))
-        p.drawRoundedRect(QRectF(self.rect()), 11, 11)
-        p.setPen(QPen(QColor("#38383a"), 1))
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        bg_col = QColor("#FFFFFF") if is_light else QColor("#1C1C1E")
+        border_col = QColor(0, 0, 0, 20) if is_light else QColor(255, 255, 255, 18)
+        sep_col = QColor(0, 0, 0, 20) if is_light else QColor(255, 255, 255, 20)
+
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        rad = 14 if getattr(self, "is_profile", False) else 11
+        p.setPen(QPen(border_col, 1))
+        p.setBrush(bg_col)
+        p.drawRoundedRect(r, rad, rad)
+
+        p.setPen(QPen(sep_col, 1))
         for row in self.rows[:-1]:
             y = row.geometry().bottom() + 0.5
-            p.drawLine(QPointF(getattr(row, "inset", 16), y), QPointF(self.width(), y))
+            p.drawLine(QPointF(getattr(row, "inset", 16), y), QPointF(self.width() - 1, y))
 
 
 class Row(QWidget):
@@ -3280,7 +4125,176 @@ class Chevron(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        draw_icon(p, "right", QRectF(-4, 0, 20, 20), QColor("#5a5a5e"))
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        chev_col = QColor("#8E8E93") if is_light else QColor("#5a5a5e")
+        draw_icon(p, "right", QRectF(-4, 0, 20, 20), chev_col)
+
+
+class AmbientPreviewPill(QWidget):
+    """Mini borderless dynamic island preview showing ambient album art glow."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(52)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        r = QRectF(self.rect())
+        
+        # Apple ambient gradient (from dark emerald #0E3A24 to deep navy #0C192C)
+        grad = QLinearGradient(0, 0, r.width(), r.height())
+        grad.setColorAt(0.0, QColor("#0E3A24"))
+        grad.setColorAt(1.0, QColor("#0C192C"))
+        p.setBrush(grad)
+        p.setPen(QPen(QColor(255, 255, 255, 25), 1.0))
+        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
+
+        # 34x34 mini album art on left (centered vertically)
+        art_rect = QRectF(10, (r.height() - 34) / 2.0, 34, 34)
+        art_grad = QLinearGradient(art_rect.topLeft(), art_rect.bottomRight())
+        art_grad.setColorAt(0.0, QColor("#30D158"))
+        art_grad.setColorAt(1.0, QColor("#0A84FF"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(art_grad)
+        p.drawRoundedRect(art_rect, 6, 6)
+        draw_icon(p, "music", art_rect.adjusted(6, 6, -6, -6), QColor("white"))
+
+        # Track title & artist
+        f_title = QFont("Segoe UI", 9)
+        f_title.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f_title)
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(QRectF(52, 10, max(10.0, r.width() - 170), 16), Qt.AlignLeft | Qt.AlignVCenter, "Let Me Down Slowly")
+
+        f_artist = QFont("Segoe UI", 8)
+        p.setFont(f_artist)
+        p.setPen(QColor(255, 255, 255, 175))
+        p.drawText(QRectF(52, 27, max(10.0, r.width() - 170), 15), Qt.AlignLeft | Qt.AlignVCenter, "Alec Benjamin")
+
+        # Mini playback controls on right [prev, play/pause, next]
+        cx = r.width() - 65
+        cy = r.height() / 2.0
+        draw_icon(p, "left", QRectF(cx - 36, cy - 8, 16, 16), QColor(255, 255, 255, 210))
+        p.fillRect(QRectF(cx - 4, cy - 6, 2.5, 12), QColor(255, 255, 255, 240))
+        p.fillRect(QRectF(cx + 2, cy - 6, 2.5, 12), QColor(255, 255, 255, 240))
+        draw_icon(p, "right", QRectF(cx + 18, cy - 8, 16, 16), QColor(255, 255, 255, 210))
+
+
+class ProgressStyleCard(QFrame):
+    """Card for selecting progress bar styles: Classic Line, Wavy Wiggle, Soundwave EQ."""
+    clicked = Signal(str)
+
+    def __init__(self, style_key, title, subtitle, parent=None):
+        super().__init__(parent)
+        self.style_key = style_key
+        self.title_text = title
+        self.subtitle_text = subtitle
+        self.selected = (CFG.get("media_progress_style", "classic") == style_key)
+        self.hover = 0.0
+        self.setFixedHeight(104)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("StyleOptionCard")
+        self.hover_anim = anim(self, 140, self._set_hover)
+
+    def _set_hover(self, v):
+        self.hover = float(v)
+        self.update()
+
+    def set_selected(self, sel):
+        self.selected = sel
+        self.update()
+
+    def enterEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 1.0)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 0.0)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.style_key)
+        super().mousePressEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        if self.selected:
+            bg_color = QColor(0, 122, 255, int(20 + 10 * self.hover)) if is_light else QColor(10, 132, 255, int(22 + 10 * self.hover))
+            border_color = QColor("#007AFF") if is_light else QColor("#0A84FF")
+            border_w = 2.0
+        else:
+            bg_color = QColor(0, 0, 0, int(8 + 8 * self.hover)) if is_light else QColor(255, 255, 255, int(9 + 8 * self.hover))
+            border_color = QColor(0, 0, 0, 25) if is_light else QColor(255, 255, 255, 25)
+            border_w = 1.0
+
+        p.setPen(QPen(border_color, border_w))
+        p.setBrush(bg_color)
+        p.drawRoundedRect(r, 14, 14)
+
+        pw = r.width() - 32
+        px = r.left() + 16
+        py = r.top() + 14
+        accent = QColor("#007AFF") if is_light else QColor("#30D158")
+        track = QColor(0, 0, 0, 30) if is_light else QColor(255, 255, 255, 35)
+
+        if self.style_key == "classic":
+            p.setPen(QPen(track, 3.5, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(px, py + 16), QPointF(px + pw, py + 16))
+            p.setPen(QPen(accent, 3.5, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(px, py + 16), QPointF(px + pw * 0.58, py + 16))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("white"))
+            p.drawEllipse(QPointF(px + pw * 0.58, py + 16), 5, 5)
+
+        elif self.style_key == "wavy":
+            p.setPen(QPen(track, 3.0, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(px, py + 16), QPointF(px + pw, py + 16))
+            wave_path = QPainterPath()
+            wave_path.moveTo(px, py + 16)
+            steps = 28
+            for i in range(steps + 1):
+                prog = i / steps
+                if prog > 0.58:
+                    break
+                wx = px + pw * prog
+                wy = py + 16 + math.sin(prog * math.pi * 5.0) * 5.5
+                wave_path.lineTo(wx, wy)
+            p.setPen(QPen(accent, 3.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(wave_path)
+
+        elif self.style_key == "soundwave":
+            p.setPen(Qt.NoPen)
+            num_bars = 14
+            bar_w = 3.0
+            gap = max(1.0, (pw - num_bars * bar_w) / (num_bars - 1))
+            heights = [6, 12, 18, 10, 22, 16, 24, 14, 20, 8, 16, 12, 18, 6]
+            for i in range(num_bars):
+                bx = px + i * (bar_w + gap)
+                bh = heights[i % len(heights)]
+                by = py + 16 - bh / 2.0
+                bar_col = accent if (i / num_bars) <= 0.6 else track
+                p.setBrush(bar_col)
+                p.drawRoundedRect(QRectF(bx, by, bar_w, bh), 1.5, 1.5)
+
+        f_t = QFont("Segoe UI", 9)
+        f_t.setWeight(QFont.Weight.Bold)
+        p.setFont(f_t)
+        p.setPen(QColor("#1D1D1F") if is_light else QColor("#FFFFFF"))
+        p.drawText(QRectF(12, 58, r.width() - 24, 18), Qt.AlignCenter, self.title_text)
+
+        f_s = QFont("Segoe UI", 8)
+        p.setFont(f_s)
+        p.setPen(QColor("#6E6E73") if is_light else QColor("#8E8E93"))
+        p.drawText(QRectF(8, 76, r.width() - 16, 16), Qt.AlignCenter, self.subtitle_text)
 
 
 class SidebarItem(QWidget):
@@ -3288,18 +4302,46 @@ class SidebarItem(QWidget):
 
     def __init__(self, title, color, icon, value=""):
         super().__init__()
+        self.title_text = title
         self.selected, self.hover = False, 0.0
-        self.setFixedHeight(42)
+        self.compact = False
+        self.setFixedHeight(36)
+        self.setMinimumHeight(36)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.PointingHandCursor)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(10, 0, 12, 0)
-        row.setSpacing(12)
-        row.addWidget(IconTile(color, icon, 29))
-        row.addWidget(QLabel(title))
-        row.addStretch()
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(10, 0, 10, 0)
+        self.row.setSpacing(10)
+        self.icon_tile = IconTile(color, icon, 26)
+        self.row.addWidget(self.icon_tile, 0, Qt.AlignmentFlag.AlignCenter)
+        self.title_lbl = QLabel(title)
+        self.row.addWidget(self.title_lbl)
+        self.spacer = QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.row.addItem(self.spacer)
         self.value = QLabel(value, objectName="muted")
-        row.addWidget(self.value)
+        self.row.addWidget(self.value)
         self.hover_anim = anim(self, 150, self._set_hover)
+
+    def set_compact(self, compact):
+        self.compact = compact
+        if compact:
+            self.setToolTip(self.title_text)
+            self.title_lbl.hide()
+            self.value.hide()
+            self.spacer.changeSize(0, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            self.row.setContentsMargins(0, 0, 0, 0)
+            self.row.setSpacing(0)
+            self.row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        else:
+            self.setToolTip("")
+            self.title_lbl.show()
+            self.value.show()
+            self.spacer.changeSize(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+            self.row.setContentsMargins(10, 0, 10, 0)
+            self.row.setSpacing(10)
+            self.row.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.row.invalidate()
+        self.update()
 
     def _set_hover(self, v):
         self.hover = float(v)
@@ -3307,7 +4349,18 @@ class SidebarItem(QWidget):
 
     def set_selected(self, on):
         self.selected = on
-        self.value.setStyleSheet("color: white;" if on else "")
+        self.update_theme()
+
+    def update_theme(self):
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        if self.selected:
+            self.title_lbl.setStyleSheet("color: #FFFFFF; font-weight: 600;")
+            self.value.setStyleSheet("color: #FFFFFF;")
+        else:
+            txt = "#1D1D1F" if is_light else "#FFFFFF"
+            mut = "#6E6E73" if is_light else "#8E8E93"
+            self.title_lbl.setStyleSheet(f"color: {txt}; font-weight: 500;")
+            self.value.setStyleSheet(f"color: {mut};")
         self.update()
 
     def enterEvent(self, e):
@@ -3322,9 +4375,26 @@ class SidebarItem(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(BLUE) if self.selected else blend(QColor(28, 28, 30, 0), QColor("#1c1c1e"), self.hover))
-        p.drawRoundedRect(QRectF(self.rect()), 10, 10)
+        is_light = getattr(self.window(), "theme", "dark") == "light"
+        r = QRectF(self.rect()).adjusted(2, 1, -2, -1) if self.compact else QRectF(self.rect())
+        if self.selected:
+            if self.compact:
+                p.setPen(QPen(QColor("#007AFF") if is_light else QColor("#0A84FF"), 2.0))
+                p.setBrush(QColor(0, 122, 255, 30) if is_light else QColor(10, 132, 255, 50))
+                p.drawRoundedRect(r, 10, 10)
+            else:
+                p.setPen(Qt.NoPen)
+                active_color = QColor("#007AFF") if is_light else QColor("#0A84FF")
+                p.setBrush(active_color)
+                p.drawRoundedRect(r, 9, 9)
+        else:
+            if self.hover > 0.01:
+                p.setPen(Qt.NoPen)
+                if is_light:
+                    p.setBrush(QColor(0, 0, 0, int(14 * self.hover)))
+                else:
+                    p.setBrush(QColor(255, 255, 255, int(16 * self.hover)))
+                p.drawRoundedRect(r, 9, 9)
 
 
 class SettingsWindow(QWidget):
@@ -3333,6 +4403,8 @@ class SettingsWindow(QWidget):
          ("tabs", "Island Tabs", "#0a84ff", "tabs"),
          ("widgets", "Widgets", "#0a84ff", "grid")],
         [("media", "Media Player", "#30d158", "music"),
+         ("weather", "Weather", "#56aeff", "cloud"),
+         ("notification", "Notifications", "#0a84ff", "bell"),
          ("prayer", "Prayer Times", "#30d158", "moon"),
          ("pomodoro", "Pomodoro", "#ff453a", "timer"),
          ("football", "Football", "#0a84ff", "ball"),
@@ -3348,47 +4420,117 @@ class SettingsWindow(QWidget):
         self.setWindowIcon(tray_icon())
         self.setObjectName("root")
         self.setAttribute(Qt.WA_StyledBackground)
-        self.setStyleSheet(SETTINGS_STYLE)
-        self.resize(920, 640)
-        self.setMinimumSize(760, 480)
+        self.theme = CFG.get("theme", "dark")
+        self.setStyleSheet(get_settings_stylesheet(self.theme))
+        self.resize(840, 680)
+        self.setMinimumSize(740, 480)
 
-        # ---- sidebar ----
-        sidebar = QWidget(objectName="sidebar")
-        sidebar.setAttribute(Qt.WA_StyledBackground)
-        sidebar.setFixedWidth(300)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(16, 18, 16, 16)
-        side.setSpacing(4)
-        side.addWidget(QLabel("Settings", objectName="bigTitle"))
-        side.addSpacing(10)
-        profile = Group()
-        card = QWidget()
-        cl = QHBoxLayout(card)
-        cl.setContentsMargins(12, 10, 12, 10)
-        cl.setSpacing(12)
-        cl.addWidget(AppIcon(52))
-        names = QVBoxLayout()
-        names.setSpacing(0)
-        t = QLabel("Dynamic Island")
-        t.setStyleSheet("font-size: 16px; font-weight: 600;")
-        sub = QLabel("Widgets, prayer times & more", objectName="muted")
-        sub.setStyleSheet("font-size: 11px;")
-        names.addWidget(t)
-        names.addWidget(sub)
-        cl.addLayout(names)
-        cl.addStretch()
-        profile.add(card)
-        side.addWidget(profile)
+        # ---- collapsible sidebar ----
+        self.sidebar_width = 260
+        self.sidebar_collapsed = False
+        self.sidebar = QWidget(objectName="sidebar")
+        self.sidebar.setAttribute(Qt.WA_StyledBackground)
+        self.sidebar.setFixedWidth(260)
+        side = QVBoxLayout(self.sidebar)
+        side.setContentsMargins(10, 14, 10, 14)
+        side.setSpacing(6)
+
+        # Header row with title & collapse button (32x32)
+        self.header_row = QHBoxLayout()
+        self.header_row.setContentsMargins(4, 0, 4, 0)
+        self.title_lbl = QLabel("Settings", objectName="bigTitle")
+        self.title_lbl.setFixedHeight(34)
+        self.collapse_btn = AppleButton("sidebar.left", "ghost", 32, "Toggle Sidebar")
+        self.collapse_btn.clicked.connect(self.toggle_sidebar)
+        self.header_row.addWidget(self.title_lbl, 1)
+        self.header_row.addWidget(self.collapse_btn)
+        side.addLayout(self.header_row)
+        side.addSpacing(6)
+
+        # "Dynamic Island" Profile Banner Card: collapses to 40x40 avatar circle
+        self.profile = Group()
+        self.profile.is_profile = True
+        self.profile.setFixedHeight(68)
+        self.profile.setMinimumHeight(54)
+        self.profile.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.brand_card = QWidget()
+        self.brand_card.setFixedHeight(68)
+        self.brand_card.setMinimumHeight(54)
+        self.brand_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.brand_layout = QHBoxLayout(self.brand_card)
+        self.brand_layout.setContentsMargins(10, 8, 10, 8)
+        self.brand_layout.setSpacing(10)
+        self.brand_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.brand_avatar = AppIcon(40)
+        self.brand_layout.addWidget(self.brand_avatar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.brand_names = QWidget()
+        bn_l = QVBoxLayout(self.brand_names)
+        bn_l.setContentsMargins(0, 0, 0, 0)
+        bn_l.setSpacing(2)
+        bn_l.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        is_light = (self.theme == "light")
+        self.profile_title = QLabel("Dynamic Island")
+        self.profile_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {'#1D1D1F' if is_light else '#FFFFFF'};")
+        self.profile_title.setFixedHeight(18)
+        self.profile_title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+
+        self.profile_sub = QLabel("Widgets & notch reactions", objectName="muted")
+        self.profile_sub.setStyleSheet(f"font-size: 11px; color: {'#6E6E73' if is_light else '#8E8E93'};")
+        self.profile_sub.setFixedHeight(15)
+        self.profile_sub.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        bn_l.addWidget(self.profile_title)
+        bn_l.addWidget(self.profile_sub)
+        self.brand_layout.addWidget(self.brand_names, 1)
+
+        self.profile.add(self.brand_card)
+        side.addWidget(self.profile)
+        side.addSpacing(8)
+
+        # Navigation scroll area
+        self.nav_scroll = QScrollArea()
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.nav_scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 6px; background: transparent; margin: 2px 0; }
+            QScrollBar::handle:vertical { background: rgba(120, 120, 128, 0.35); border-radius: 3px; min-height: 20px; }
+            QScrollBar::handle:vertical:hover { background: rgba(120, 120, 128, 0.55); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        nav_container = QWidget()
+        nav_container.setStyleSheet("background: transparent;")
+        self.nav_layout = QVBoxLayout(nav_container)
+        self.nav_layout.setContentsMargins(0, 0, 4, 0)
+        self.nav_layout.setSpacing(4)
 
         self.items = {}
-        for section in self.SECTIONS:
-            side.addSpacing(16)
+        for s_idx, section in enumerate(self.SECTIONS):
+            if s_idx > 0:
+                self.nav_layout.addSpacing(10)
             for key, title, color, icon in section:
                 item = SidebarItem(title, color, icon)
                 item.clicked.connect(lambda k=key: self.select(k))
                 self.items[key] = item
-                side.addWidget(item)
-        side.addStretch()
+                self.nav_layout.addWidget(item)
+
+        self.nav_layout.addStretch(1)
+        self.nav_scroll.setWidget(nav_container)
+        side.addWidget(self.nav_scroll, 1)
+
+        # Sidebar animation
+        self.sidebar_anim = QVariantAnimation(self)
+        self.sidebar_anim.setDuration(220)
+        self.sidebar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.sidebar_anim.valueChanged.connect(self._on_sidebar_anim)
 
         # ---- detail pane ----
         detail = QWidget(objectName="detail")
@@ -3399,7 +4541,6 @@ class SettingsWindow(QWidget):
         self.page_title = QLabel(objectName="pageTitle")
         self.page_title.setAlignment(Qt.AlignCenter)
         dl.addWidget(self.page_title)
-        from PySide6.QtWidgets import QScrollArea
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -3410,20 +4551,82 @@ class SettingsWindow(QWidget):
         self.fade = QPropertyAnimation(self.fade_fx, b"opacity", self)
         self.fade.setDuration(200)
 
-        divider = QWidget()
-        divider.setFixedWidth(1)
-        divider.setStyleSheet("background: #1c1c1e;")
+        self.divider = QWidget()
+        self.divider.setFixedWidth(1)
+        self.divider.setStyleSheet("background: rgba(0, 0, 0, 0.10);" if is_light else "background: rgba(255, 255, 255, 0.08);")
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(sidebar)
-        root.addWidget(divider)
+        root.addWidget(self.sidebar)
+        root.addWidget(self.divider)
         root.addWidget(detail, 1)
 
         self.current = None
         self.update_badges()
         self.select("general")
-        dark_title_bar(self)
+        dark_title_bar(self, dark=(self.theme != "light"))
+
+    def toggle_sidebar(self):
+        start = self.sidebar.width()
+        end = 64 if not self.sidebar_collapsed else 260
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        self.sidebar_anim.setStartValue(start)
+        self.sidebar_anim.setEndValue(end)
+        self.sidebar_anim.start()
+
+    def _on_sidebar_anim(self, val):
+        w = int(val)
+        self.sidebar.setFixedWidth(w)
+        collapsed = (w < 150)
+        self.title_lbl.setVisible(not collapsed)
+        self.brand_names.setVisible(not collapsed)
+        if collapsed:
+            self.profile.setFixedHeight(48)
+            self.brand_card.setFixedHeight(48)
+            self.brand_layout.setContentsMargins(0, 0, 0, 0)
+            self.brand_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.brand_avatar.setFixedSize(36, 36)
+            self.header_row.setContentsMargins(0, 0, 0, 0)
+            self.header_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if hasattr(self, "nav_scroll"):
+                self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            if hasattr(self, "nav_layout"):
+                self.nav_layout.setContentsMargins(0, 0, 0, 0)
+        else:
+            self.profile.setFixedHeight(68)
+            self.brand_card.setFixedHeight(68)
+            self.brand_layout.setContentsMargins(10, 8, 10, 8)
+            self.brand_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.brand_avatar.setFixedSize(40, 40)
+            self.header_row.setContentsMargins(4, 0, 4, 0)
+            self.header_row.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            if hasattr(self, "nav_scroll"):
+                self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            if hasattr(self, "nav_layout"):
+                self.nav_layout.setContentsMargins(0, 0, 4, 0)
+        for item in self.items.values():
+            item.set_compact(collapsed)
+
+    def apply_theme(self, mode: str):
+        self.theme = mode
+        CFG["theme"] = mode
+        save_config()
+        self.setStyleSheet(get_settings_stylesheet(mode))
+        is_light = (mode == "light")
+        if hasattr(self, "divider"):
+            self.divider.setStyleSheet("background: rgba(0, 0, 0, 0.10);" if is_light else "background: rgba(255, 255, 255, 0.08);")
+        if hasattr(self, "profile_title"):
+            self.profile_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {'#1D1D1F' if is_light else '#FFFFFF'};")
+        if hasattr(self, "profile_sub"):
+            self.profile_sub.setStyleSheet(f"font-size: 11px; color: {'#6E6E73' if is_light else '#8E8E93'};")
+        for key, item in self.items.items():
+            item.update_theme()
+        dark_title_bar(self, dark=not is_light)
+        self.update()
+        if hasattr(self, "refresh_page"):
+            self.refresh_page()
+        if self.island and hasattr(self.island, "apply_theme"):
+            self.island.apply_theme(mode)
 
     # ---- helpers ----
     def set(self, key, value):
@@ -3438,6 +4641,11 @@ class SettingsWindow(QWidget):
             self.items["widgets"].value.setText(f"{on} on")
         if "tabs" in self.items:
             self.items["tabs"].value.setText(f"{on} active")
+        if "weather" in self.items:
+            unit_str = "°F" if CFG.get("weather_unit", 0) == 1 else "°C"
+            self.items["weather"].value.setText(unit_str)
+        if "notification" in self.items:
+            self.items["notification"].value.setText("Live" if CFG.get("notifications_enabled", True) else "Off")
         if "prayer" in self.items:
             self.items["prayer"].value.setText(CFG["city"] or "Auto")
         left = remaining_todos(datetime.date.today().weekday())
@@ -3445,22 +4653,22 @@ class SettingsWindow(QWidget):
             self.items["todo"].value.setText(f"{left} today" if left else "")
 
     def toggle(self, key):
-        t = Toggle(bool(CFG[key]))
+        t = Toggle(bool(CFG.get(key, True)))
         t.toggled.connect(lambda v: self.set(key, v))
         return t
 
     def stepper(self, key, lo, hi, step=1, suffix=""):
-        s = Stepper(int(CFG[key]), lo, hi, step, suffix)
+        s = Stepper(int(CFG.get(key, lo)), lo, hi, step, suffix)
         s.changed.connect(lambda v: self.set(key, v))
         return s
 
     def text_field(self, key, placeholder):
         from PySide6.QtWidgets import QLineEdit
-        e = QLineEdit(CFG[key])
+        e = QLineEdit(CFG.get(key, ""))
         e.setPlaceholderText(placeholder)
         e.setAlignment(Qt.AlignRight)
         e.setFixedWidth(220)
-        e.editingFinished.connect(lambda: CFG[key] != e.text().strip() and self.set(key, e.text().strip()))
+        e.editingFinished.connect(lambda: CFG.get(key) != e.text().strip() and self.set(key, e.text().strip()))
         return e
 
     def section(self, layout, rows, header=None, footer=None):
@@ -3491,12 +4699,16 @@ class SettingsWindow(QWidget):
         for k, item in self.items.items():
             item.set_selected(k == key)
         self.page_title.setText({k: t for s in self.SECTIONS for k, t, _, _ in s}[key])
+
+        # Stretched responsive content page inside scroll area (Apple macOS HIG)
         page = QWidget()
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(36, 14, 36, 24)
+        lay.setContentsMargins(36, 14, 36, 28)
         lay.setSpacing(6)
         getattr(self, f"page_{key}")(lay)
         lay.addStretch()
+
         old = self.scroll.takeWidget()
         if old:
             old.deleteLater()
@@ -3516,28 +4728,24 @@ class SettingsWindow(QWidget):
 
     # ---- pages ----
     def page_tabs(self, lay):
-        # Description banner
         desc_lbl = QLabel("Toggle and organize active modules inside the expanded island card.")
         desc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 13px; margin-bottom: 8px;")
         lay.addWidget(desc_lbl)
 
-        # Informational alert banner
-        banner = QWidget()
-        banner.setStyleSheet("background: rgba(10, 132, 255, 0.12); border: 1px solid rgba(10, 132, 255, 0.28); "
-                             "border-radius: 9px;")
+        banner = QFrame(objectName="InfoBanner")
+        banner.setStyleSheet("background: rgba(10, 132, 255, 0.12); border: 1px solid rgba(10, 132, 255, 0.28); border-radius: 12px;")
         bl = QHBoxLayout(banner)
         bl.setContentsMargins(14, 10, 14, 10)
         bl.setSpacing(10)
         info_icon = QLabel("ⓘ")
-        info_icon.setStyleSheet("color: #0a84ff; font-weight: bold; font-size: 14px;")
+        info_icon.setStyleSheet("color: #0a84ff; font-weight: bold; font-size: 14px; border: none; background: transparent;")
         info_txt = QLabel("At least 1 tab must remain enabled so the Dynamic Island stays functional.")
-        info_txt.setStyleSheet("color: #80c4ff; font-size: 12px;")
+        info_txt.setStyleSheet("color: #80c4ff; font-size: 12px; border: none; background: transparent;")
         bl.addWidget(info_icon)
         bl.addWidget(info_txt, 1)
         lay.addWidget(banner)
         lay.addSpacing(14)
 
-        # Universal Media Player Tab card
         is_media_on = any(w["id"] == "media" and w["on"] for w in CFG["widgets"])
         t_media = Toggle(is_media_on)
 
@@ -3555,40 +4763,19 @@ class SettingsWindow(QWidget):
                 icon=("#30d158", "music"))
         ])
 
-        # Ambient Album Art Background card with visual mockup preview
+        # Ambient Album Art Background card with clean AmbientPreviewPill
         t_ambient = self.toggle("media_ambient_glow")
         ambient_row = Row("Ambient Album Art Background", t_ambient,
                           subtitle="Spread playing song and video thumbnail colors across the island body in a blurred ambient glow",
                           icon=("#ff375f", "image"))
-
-        # Visual preview pill showing the ambient glow & media layout
-        preview_box = QWidget()
-        preview_box.setFixedHeight(72)
-        preview_box.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
-                                  "stop:0 rgba(29, 185, 84, 0.35), stop:0.5 #101012, stop:1 rgba(10, 132, 255, 0.25)); "
-                                  "border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 18px;")
-        pl = QHBoxLayout(preview_box)
-        pl.setContentsMargins(18, 0, 18, 0)
-        pl.setSpacing(12)
-        p_art = QLabel("🎵")
-        p_art.setFixedSize(32, 32)
-        p_art.setAlignment(Qt.AlignCenter)
-        p_art.setStyleSheet("background: #1db954; border-radius: 7px; font-size: 14px;")
-        p_txt = QLabel("Let Me Down Slowly · <span style='color:#8e8e93'>Alec Benjamin</span>")
-        p_txt.setTextFormat(Qt.RichText)
-        p_txt.setStyleSheet("font-size: 11px; font-weight: 600;")
-        p_ctrls = QLabel("⏮   ⏸   ⏭")
-        p_ctrls.setStyleSheet("color: white; font-weight: bold; font-size: 12px;")
-        pl.addWidget(p_art)
-        pl.addWidget(p_txt, 1)
-        pl.addWidget(p_ctrls)
 
         preview_card = QWidget()
         preview_l = QVBoxLayout(preview_card)
         preview_l.setContentsMargins(14, 8, 14, 12)
         preview_l.setSpacing(10)
         preview_l.addWidget(ambient_row)
-        preview_l.addWidget(preview_box)
+        preview_pill = AmbientPreviewPill()
+        preview_l.addWidget(preview_pill)
 
         g_ambient = Group()
         g_ambient.add(preview_card)
@@ -3597,87 +4784,277 @@ class SettingsWindow(QWidget):
 
         # Progress Bar Style Selection: Classic Line | Wavy Wiggle | Soundwave EQ
         lay.addWidget(QLabel("PROGRESS BAR STYLE", objectName="groupHeader"))
-        style_sub = QLabel("Choose visual aesthetic for media timeline progress and interactive scrubber",
-                           objectName="groupFooter")
+        style_sub = QLabel("Choose visual aesthetic for media timeline progress and interactive scrubber", objectName="groupFooter")
         lay.addWidget(style_sub)
         lay.addSpacing(6)
 
         style_cards = QHBoxLayout()
         style_cards.setSpacing(12)
 
-        cur_style = CFG.get("media_progress_style", "classic")
         styles = [
             ("classic", "Classic Line", "Clean straight slider"),
             ("wavy", "Wavy Wiggle", "iOS 16 animated wave"),
             ("soundwave", "Soundwave EQ", "Rhythmic audio bars"),
         ]
 
-        def set_style(st):
-            self.set("media_progress_style", st)
-            self.refresh_page()
-
+        self.style_card_widgets = []
         for s_id, s_title, s_desc in styles:
-            is_active = (cur_style == s_id)
-            c = QWidget()
-            c.setCursor(Qt.PointingHandCursor)
-            c.setFixedHeight(94)
-            c.setStyleSheet(
-                f"background: #1c1c1e; "
-                f"border: {2 if is_active else 1}px solid {'#30d158' if is_active else '#38383a'}; "
-                f"border-radius: 12px;"
-            )
-            cl = QVBoxLayout(c)
-            cl.setContentsMargins(10, 10, 10, 10)
-            cl.setSpacing(4)
-            cl.setAlignment(Qt.AlignCenter)
-
-            # Miniature icon / visual indicator
-            vis = QLabel()
-            vis.setAlignment(Qt.AlignCenter)
-            if s_id == "classic":
-                vis.setText("──────●──────")
-                vis.setStyleSheet(f"color: {'#30d158' if is_active else '#8e8e93'}; font-size: 11px;")
-            elif s_id == "wavy":
-                vis.setText("〰〰〰●─────")
-                vis.setStyleSheet(f"color: {'#30d158' if is_active else '#8e8e93'}; font-size: 12px;")
-            else:
-                vis.setText(" ▂▃▅▆▇▆▅▃▂ ")
-                vis.setStyleSheet(f"color: {'#30d158' if is_active else '#8e8e93'}; font-size: 12px;")
-
-            t_lbl = QLabel(s_title)
-            t_lbl.setAlignment(Qt.AlignCenter)
-            t_lbl.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {'white' if is_active else '#8e8e93'};")
-            d_lbl = QLabel(s_desc, objectName="muted")
-            d_lbl.setAlignment(Qt.AlignCenter)
-            d_lbl.setStyleSheet("font-size: 9px;")
-
-            cl.addWidget(vis)
-            cl.addWidget(t_lbl)
-            cl.addWidget(d_lbl)
-
-            c.mousePressEvent = lambda _, sid=s_id: set_style(sid)
-            style_cards.addWidget(c)
+            card_w = ProgressStyleCard(s_id, s_title, s_desc)
+            card_w.clicked.connect(self.on_style_selected)
+            self.style_card_widgets.append(card_w)
+            style_cards.addWidget(card_w)
 
         lay.addLayout(style_cards)
         lay.addSpacing(18)
+
+        # Real-time Synced Lyrics section
+        lyrics_layout_seg = Segmented(["3-Line Expanded", "1-Line Compact"], width=230)
+        lyrics_layout_seg.index = lyrics_layout_seg.pos = CFG.get("lyrics_layout", 0)
+        lyrics_layout_seg.changed.connect(lambda i: self.set("lyrics_layout", i))
+
+        self.section(lay, [
+            Row("Real-Time Synced Lyrics (LRCLIB)", self.toggle("lyrics_enabled"),
+                subtitle="Fetch and synchronize live karaoke lyrics automatically while songs play",
+                icon=("#bf5af2", "music")),
+            Row("Lyrics Layout Style", lyrics_layout_seg,
+                subtitle="Choose between multi-line karaoke viewport or compact single active line"),
+            Row("Click-to-Seek Lyrics", self.toggle("lyrics_click_seek"),
+                subtitle="Jump song playback timestamp directly when clicking any upcoming lyric line"),
+        ], "Synced Lyrics")
+
+    def on_style_selected(self, st):
+        self.set("media_progress_style", st)
+        if hasattr(self, "style_card_widgets"):
+            for cw in self.style_card_widgets:
+                cw.set_selected(cw.style_key == st)
 
     def page_media(self, lay):
         self.page_tabs(lay)
 
     def page_general(self, lay):
+        # Notch Eyes & Reactions (Apple HIG & @ui-ux-pro-max)
+        self.section(lay, [
+            Row("Interactive Eyes Follow Cursor", self.toggle("eyes_tracking"),
+                subtitle="Geometric minimalist capsules follow mouse position with natural 3D parallax tracking",
+                icon=("#30d158", "eye")),
+            Row("Idle Expressions & Reactions", self.toggle("eyes_reactions"),
+                subtitle="Eyes react playfully with happy arcs, side-eye, winks, and sleep breathing when idle"),
+            Row("Idle Reaction Delay", self.stepper("eyes_idle_delay", 2, 15, 1, " s"),
+                subtitle="Seconds of inactivity before entering playful reactions"),
+        ], "Notch Eyes & Reactions")
+
+        # Camera & Microphone Privacy Indicators
+        self.section(lay, [
+            Row("Camera & Microphone Privacy Alerts", self.toggle("privacy_alerts"),
+                subtitle="Notch indicators glow Apple Green (Camera) and Orange (Mic) with drop-down alerts",
+                icon=("#ff9f0a", "bell")),
+            Row("Privacy Alert Toast Duration", self.stepper("privacy_toast_duration", 2, 10, 1, " s"),
+                subtitle="Duration the privacy alert pill stays expanded before collapsing"),
+        ], "Privacy Indicators")
+
+        # Behavior
         self.section(lay, [
             Row("Shrink to a line when idle", self.toggle("shrink_idle"),
                 subtitle="The pill becomes a thin line at the top of the screen"),
             Row("Shrink after", self.stepper("idle_seconds", 2, 60, 1, " s")),
         ], "Behavior")
-        size = Segmented(["Compact", "Regular", "Large"], width=240, track="#2c2c2e")
-        size.index = size.pos = CFG["size"]
+
+        theme_idx = 0 if self.theme == "dark" else 1
+        theme_seg = Segmented(["Dark", "Light"], width=170)
+        theme_seg.index = theme_seg.pos = theme_idx
+        theme_seg.changed.connect(lambda i: self.apply_theme("light" if i == 1 else "dark"))
+
+        size = Segmented(["Compact", "Regular", "Large"], width=240)
+        size.index = size.pos = CFG.get("size", 1)
         size.changed.connect(lambda i: self.set("size", i))
-        self.section(lay, [Row("Island size", size)], "Appearance",
-                     "Hover the island to see the new size.")
+        self.section(lay, [
+            Row("Theme", theme_seg),
+            Row("Island size", size),
+        ], "Appearance", "Hover the island to see the new size.")
         self.section(lay, [Row("Open at startup", self.toggle("start_with_windows"),
                                subtitle="Start the island when you sign in to Windows")],
                      "Startup")
+
+    def page_weather(self, lay):
+        # Weather tab enabled toggle
+        is_weather_on = any(w["id"] == "weather" and w["on"] for w in CFG["widgets"])
+        t_weather = Toggle(is_weather_on)
+
+        def on_toggle_weather(val):
+            for i, w in enumerate(CFG["widgets"]):
+                if w["id"] == "weather":
+                    self.enable_widget(i, val, t_weather)
+                    break
+            self.refresh_page()
+
+        t_weather.toggled.connect(on_toggle_weather)
+
+        unit_seg = Segmented(["Celsius (°C)", "Fahrenheit (°F)"], width=230)
+        unit_seg.index = unit_seg.pos = CFG.get("weather_unit", 0)
+        unit_seg.changed.connect(lambda i: self.set("weather_unit", i))
+
+        self.section(lay, [
+            Row("Immersive Weather Tab", t_weather,
+                subtitle="Display current conditions, daylight progress bar, and 6-day frosted capsules",
+                icon=("#56aeff", "cloud")),
+            Row("City / Location", self.text_field("city", "Fez (Automatic)"),
+                subtitle="Leave empty to automatically use your current location"),
+            Row("Temperature Unit", unit_seg,
+                subtitle="Choose preferred temperature display unit across all forecasts"),
+            Row("Dynamic Sky Gradient", self.toggle("weather_dynamic_gradient"),
+                subtitle="Animate smooth atmospheric daylight sky transitions across the expanded card background"),
+        ], "Weather Forecast")
+
+        self.section(lay, [self.action("Refresh weather now", lambda: (
+            hasattr(self.island, "weather") and hasattr(self.island.weather, "fetcher") and self.island.weather.fetcher.fetch()
+        ))])
+
+        # Current Weather Live Preview Card
+        lay.addWidget(QLabel("CURRENT LIVE CONDITIONS", objectName="groupHeader"))
+        g_live = Group()
+        w_data = getattr(self.island, "weather", None)
+        c_text = "Partly Cloudy 25°C"
+        c_city = CFG.get("city") or "Fez"
+        c_day = datetime.datetime.now().strftime("%A, %H:%M")
+        c_dl = "10 h 36 m daylight"
+        if w_data and hasattr(w_data, "cond_temp_lbl"):
+            c_text = w_data.cond_temp_lbl.text()
+            c_city = w_data.city_lbl.text()
+            c_day = w_data.day_time_lbl.text()
+            c_dl = w_data.daylight_span_lbl.text()
+        g_live.add(Row(f"{c_city} · {c_text}", subtitle=f"{c_day} · {c_dl}", icon=("#56aeff", "cloud")))
+        lay.addWidget(g_live)
+
+    def page_notification(self, lay):
+        is_light = getattr(self, "theme", "dark") == "light"
+
+        # Info / Status Banner
+        banner = QFrame(objectName="InfoBanner")
+        b_bg = "rgba(0, 122, 255, 0.08)" if is_light else "rgba(10, 132, 255, 0.12)"
+        b_border = "rgba(0, 122, 255, 0.22)" if is_light else "rgba(10, 132, 255, 0.28)"
+        banner.setStyleSheet(f"background: {b_bg}; border: 1px solid {b_border}; border-radius: 12px;")
+        bl = QHBoxLayout(banner)
+        bl.setContentsMargins(14, 10, 14, 10)
+        bl.setSpacing(10)
+        info_icon = QLabel("🔔")
+        info_icon.setStyleSheet(f"color: {'#007AFF' if is_light else '#0a84ff'}; font-size: 14px; border: none; background: transparent;")
+        info_txt = QLabel("Live Windows Notifications active · Monitoring wpndatabase.db in real time")
+        info_txt.setStyleSheet(f"color: {'#007AFF' if is_light else '#80c4ff'}; font-size: 12px; font-weight: 500; border: none; background: transparent;")
+        bl.addWidget(info_icon)
+        bl.addWidget(info_txt, 1)
+        lay.addWidget(banner)
+        lay.addSpacing(10)
+
+        is_notif_on = any(w["id"] == "notification" and w["on"] for w in CFG["widgets"])
+        t_notif = Toggle(is_notif_on)
+
+        def on_toggle_notif(val):
+            for i, w in enumerate(CFG["widgets"]):
+                if w["id"] == "notification":
+                    self.enable_widget(i, val, t_notif)
+                    break
+            self.refresh_page()
+
+        t_notif.toggled.connect(on_toggle_notif)
+
+        limit_seg = Segmented(["10", "20", "50"], width=180)
+        limit_seg.index = limit_seg.pos = CFG.get("notifications_history_limit", 1)
+        limit_seg.changed.connect(lambda i: self.set("notifications_history_limit", i))
+
+        self.section(lay, [
+            Row("Notification Center Tab", t_notif,
+                subtitle="Real-time Windows toast notifications aggregated in the island carousel",
+                icon=("#0a84ff", "bell")),
+            Row("Live Windows Notifications", self.toggle("notifications_enabled"),
+                subtitle="Monitor Windows Notification database (wpndatabase.db) for live alerts"),
+            Row("Show Unread Badge Counter", self.toggle("notifications_show_badge"),
+                subtitle="Display glowing badge count on the notification header and collapsed notch"),
+            Row("Auto-Expand Notch on Alert", self.toggle("notifications_auto_expand"),
+                subtitle="Briefly expand dynamic island into an alert banner when high-priority notifications arrive"),
+            Row("Max History Limit", limit_seg,
+                subtitle="Maximum number of past notifications preserved in the notification list"),
+        ], "Notification Center")
+
+        # Action Buttons Row
+        action_card = Group()
+        act_w = QWidget()
+        act_lay = QHBoxLayout(act_w)
+        act_lay.setContentsMargins(12, 8, 12, 8)
+        act_lay.setSpacing(10)
+
+        def send_test_notification():
+            test_item = {
+                "id": f"test_{int(time.time()*1000)}",
+                "app": "Antigravity",
+                "color": "#0A84FF",
+                "icon": "bell",
+                "title": "Welcome to Dynamic Island",
+                "body": "Real-time Windows notification listening is active and operational.",
+                "time": "Just now",
+                "timestamp": time.time(),
+            }
+            if hasattr(self.island, "notification"):
+                self.island.notification.all_notifications.insert(0, test_item)
+                self.island.notification._refresh_cards()
+                self.refresh_page()
+
+        def clear_notifications():
+            if hasattr(self.island, "notification") and hasattr(self.island.notification, "clear_all"):
+                self.island.notification.clear_all()
+            self.refresh_page()
+
+        b_test = QPushButton("Send Test Notification", objectName="action")
+        b_test.setCursor(Qt.PointingHandCursor)
+        b_test.clicked.connect(send_test_notification)
+
+        b_clear = QPushButton("Clear All Notifications", objectName="danger")
+        b_clear.setCursor(Qt.PointingHandCursor)
+        b_clear.clicked.connect(clear_notifications)
+
+        act_lay.addWidget(b_test)
+        act_lay.addWidget(b_clear)
+        action_card.add(act_w)
+        lay.addWidget(action_card)
+        lay.addSpacing(18)
+
+        # Recent Notifications Section
+        lay.addWidget(QLabel("RECENT NOTIFICATIONS", objectName="groupHeader"))
+        g_recent = Group()
+        active_notifs = []
+        if hasattr(self.island, "notification") and hasattr(self.island.notification, "_get_active_notifications"):
+            active_notifs = self.island.notification._get_active_notifications()
+
+        if active_notifs:
+            for n in active_notifs[:6]:
+                app_name = n.get("app", "Notification")
+                title = n.get("title", "")
+                body = n.get("body", "")
+                icon_col = n.get("color", "#0A84FF")
+                icon_type = n.get("icon", "bell")
+                t_str = n.get("time", "")
+                sub = f"{title} · {body}" if title and body else (title or body)
+                g_recent.add(Row(f"{app_name} ({t_str})", subtitle=sub, icon=(icon_col, icon_type)))
+        else:
+            empty_w = QWidget()
+            el = QVBoxLayout(empty_w)
+            el.setContentsMargins(20, 24, 20, 24)
+            el.setSpacing(6)
+            el.setAlignment(Qt.AlignCenter)
+            icon_lbl = QLabel("🔔")
+            icon_lbl.setAlignment(Qt.AlignCenter)
+            icon_lbl.setStyleSheet(f"font-size: 24px; color: {'rgba(0,0,0,0.25)' if is_light else 'rgba(255,255,255,0.25)'}; border: none; background: transparent;")
+            msg_lbl = QLabel("No new notifications")
+            msg_lbl.setAlignment(Qt.AlignCenter)
+            msg_lbl.setStyleSheet(f"color: {'#1D1D1F' if is_light else 'rgba(255, 255, 255, 0.70)'}; font-size: 13px; font-weight: 600; border: none; background: transparent;")
+            sub_lbl = QLabel("Incoming Windows toast alerts from apps like WhatsApp, Chrome, and Outlook will appear here.")
+            sub_lbl.setAlignment(Qt.AlignCenter)
+            sub_lbl.setStyleSheet(f"color: {'rgba(60, 60, 67, 0.60)' if is_light else 'rgba(255, 255, 255, 0.40)'}; font-size: 11px; border: none; background: transparent;")
+            el.addWidget(icon_lbl)
+            el.addWidget(msg_lbl)
+            el.addWidget(sub_lbl)
+            g_recent.add(empty_w)
+
+        lay.addWidget(g_recent)
 
     def page_widgets(self, lay):
         rows = []
@@ -3941,24 +5318,1509 @@ class SmoothStackedWidget(QStackedWidget):
             super().paintEvent(e)
 
 
+# ======================= Weather & Apple SF Vector Painters =======================
+def draw_apple_cloud_path(cx, cy, s):
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    r = s * 0.20
+    c1 = QPainterPath()
+    c1.addEllipse(QPointF(cx - r * 0.72, cy + r * 0.12), r * 0.78, r * 0.78)
+    c2 = QPainterPath()
+    c2.addEllipse(QPointF(cx + r * 0.08, cy - r * 0.38), r * 1.05, r * 1.05)
+    c3 = QPainterPath()
+    c3.addEllipse(QPointF(cx + r * 0.88, cy + r * 0.15), r * 0.70, r * 0.70)
+    base = QPainterPath()
+    base.addRoundedRect(QRectF(cx - r * 1.35, cy - r * 0.12, r * 2.85, r * 1.15), r * 0.55, r * 0.55)
+    full = c1.united(c2).united(c3).united(base)
+    full.setFillRule(Qt.FillRule.WindingFill)
+    return full
+
+
+def draw_apple_bubble_fill(p, rect, color):
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    c = rect.center()
+    s = min(rect.width(), rect.height())
+    w, h = s * 0.68, s * 0.52
+    body = QPainterPath()
+    body.setFillRule(Qt.FillRule.WindingFill)
+    r = h * 0.44
+    body.addRoundedRect(QRectF(c.x() - w/2, c.y() - h/2 - s * 0.04, w, h), r, r)
+    tail = QPainterPath()
+    tail.setFillRule(Qt.FillRule.WindingFill)
+    tx = c.x() - w * 0.22
+    ty = c.y() + h/2 - s * 0.04
+    tail.moveTo(tx, ty - 1.5)
+    tail.lineTo(tx - s * 0.16, ty + s * 0.14)
+    tail.lineTo(tx + s * 0.10, ty - 1.5)
+    tail.closeSubpath()
+    full = body.united(tail)
+    full.setFillRule(Qt.FillRule.WindingFill)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawPath(full)
+    p.restore()
+
+
+def draw_apple_bell_fill(p, rect, color):
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    c = rect.center()
+    s = min(rect.width(), rect.height())
+    b = s * 0.28
+    top_loop = QPainterPath()
+    top_loop.setFillRule(Qt.FillRule.WindingFill)
+    top_loop.addEllipse(QPointF(c.x(), c.y() - b * 1.10), b * 0.15, b * 0.15)
+    bell = QPainterPath()
+    bell.setFillRule(Qt.FillRule.WindingFill)
+    bell.moveTo(c.x() - b * 0.85, c.y() + b * 0.65)
+    bell.lineTo(c.x() - b * 0.65, c.y() + b * 0.42)
+    bell.cubicTo(c.x() - b * 0.65, c.y() - b * 0.95, c.x() + b * 0.65, c.y() - b * 0.95,
+                 c.x() + b * 0.65, c.y() + b * 0.42)
+    bell.lineTo(c.x() + b * 0.85, c.y() + b * 0.65)
+    bell.closeSubpath()
+    full = top_loop.united(bell)
+    full.setFillRule(Qt.FillRule.WindingFill)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawPath(full)
+    p.drawEllipse(QPointF(c.x(), c.y() + b * 0.80), b * 0.20, b * 0.20)
+    p.restore()
+
+
+def _paint_apple_cloud(p, cx, cy, s, base_color=None, dark_storm=False):
+    cloud = draw_apple_cloud_path(cx, cy, s)
+
+    # Soft ambient drop shadow underneath cloud
+    p.save()
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(15, 30, 60, 40))
+    shadow = draw_apple_cloud_path(cx, cy + max(1.2, s * 0.035), s)
+    p.drawPath(shadow)
+    p.restore()
+
+    # Volumetric Apple gradient
+    grad = QLinearGradient(0, cy - s * 0.35, 0, cy + s * 0.28)
+    if dark_storm:
+        grad.setColorAt(0.0, QColor("#EAF0F8"))
+        grad.setColorAt(0.55, QColor("#A4B9D2"))
+        grad.setColorAt(1.0, QColor("#6B829E"))
+    else:
+        grad.setColorAt(0.0, QColor("#FFFFFF"))
+        grad.setColorAt(0.65, QColor("#E2EFFF"))
+        grad.setColorAt(1.0, QColor("#B5D5FA"))
+
+    p.setPen(QPen(QColor(255, 255, 255, 130), max(0.8, s * 0.025)))
+    p.setBrush(grad if base_color is None else QColor(base_color))
+    p.drawPath(cloud)
+
+
+def draw_weather_icon(p, icon_type, rect, is_day=True, color=None):
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    c = rect.center()
+    s = min(rect.width(), rect.height())
+
+    if icon_type == "sun":
+        p.setPen(Qt.NoPen)
+        sun_grad = QRadialGradient(c.x(), c.y(), s * 0.24)
+        sun_grad.setColorAt(0.0, QColor("#FFF176"))
+        sun_grad.setColorAt(0.8, QColor("#FFD60A"))
+        sun_grad.setColorAt(1.0, QColor("#FFA000"))
+        p.setBrush(sun_grad)
+        r = s * 0.22
+        p.drawEllipse(c, r, r)
+        ray_pen = QPen(QColor("#FFD60A"), max(2.0, s * 0.085), Qt.SolidLine, Qt.RoundCap)
+        p.setPen(ray_pen)
+        for i in range(8):
+            ang = math.radians(i * 45)
+            x1 = c.x() + (r + s * 0.06) * math.cos(ang)
+            y1 = c.y() + (r + s * 0.06) * math.sin(ang)
+            x2 = c.x() + (r + s * 0.18) * math.cos(ang)
+            y2 = c.y() + (r + s * 0.18) * math.sin(ang)
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+    elif icon_type == "moon":
+        moon_c = QColor("#E5E5EA") if color is None else QColor(color)
+        p.setPen(Qt.NoPen)
+        moon_grad = QLinearGradient(c.x() - s * 0.2, c.y() - s * 0.2, c.x() + s * 0.2, c.y() + s * 0.2)
+        moon_grad.setColorAt(0.0, QColor("#FFFFFF"))
+        moon_grad.setColorAt(1.0, moon_c)
+        p.setBrush(moon_grad)
+        r = s * 0.30
+        full = QPainterPath()
+        full.setFillRule(Qt.FillRule.WindingFill)
+        full.addEllipse(c, r, r)
+        bite = QPainterPath()
+        bite.setFillRule(Qt.FillRule.WindingFill)
+        bite.addEllipse(QPointF(c.x() + r * 0.45, c.y() - r * 0.25), r * 0.85, r * 0.85)
+        p.drawPath(full.subtracted(bite))
+
+    elif icon_type in ("cloud", "fog"):
+        _paint_apple_cloud(p, c.x(), c.y(), s, color)
+        if icon_type == "fog":
+            p.setPen(QPen(QColor(255, 255, 255, 190), max(1.5, s * 0.07), Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(c.x() - s * 0.24, c.y() + s * 0.32), QPointF(c.x() + s * 0.24, c.y() + s * 0.32))
+            p.drawLine(QPointF(c.x() - s * 0.16, c.y() + s * 0.42), QPointF(c.x() + s * 0.16, c.y() + s * 0.42))
+
+    elif icon_type == "sun_cloud":
+        sun_c = QPointF(c.x() - s * 0.15, c.y() - s * 0.15)
+        sun_r = s * 0.19
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFD60A"))
+        p.drawEllipse(sun_c, sun_r, sun_r)
+        ray_pen = QPen(QColor("#FFD60A"), max(1.8, s * 0.08), Qt.SolidLine, Qt.RoundCap)
+        p.setPen(ray_pen)
+        for ang_deg in (120, 160, 200, 240, 280):
+            ang = math.radians(ang_deg)
+            x1 = sun_c.x() + (sun_r + s * 0.05) * math.cos(ang)
+            y1 = sun_c.y() + (sun_r + s * 0.05) * math.sin(ang)
+            x2 = sun_c.x() + (sun_r + s * 0.16) * math.cos(ang)
+            y2 = sun_c.y() + (sun_r + s * 0.16) * math.sin(ang)
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        _paint_apple_cloud(p, c.x() + s * 0.05, c.y() + s * 0.06, s * 0.88, color)
+
+    elif icon_type == "moon_cloud":
+        moon_c = QColor("#E5E5EA")
+        p.setPen(Qt.NoPen)
+        p.setBrush(moon_c)
+        r_m = s * 0.20
+        full = QPainterPath()
+        full.setFillRule(Qt.FillRule.WindingFill)
+        full.addEllipse(QPointF(c.x() - s * 0.14, c.y() - s * 0.16), r_m, r_m)
+        bite = QPainterPath()
+        bite.setFillRule(Qt.FillRule.WindingFill)
+        bite.addEllipse(QPointF(c.x() - s * 0.08, c.y() - s * 0.20), r_m * 0.85, r_m * 0.85)
+        p.drawPath(full.subtracted(bite))
+        _paint_apple_cloud(p, c.x() + s * 0.05, c.y() + s * 0.06, s * 0.88, color)
+
+    elif icon_type in ("rain", "drizzle"):
+        cy_off = c.y() - s * 0.10
+        _paint_apple_cloud(p, c.x(), cy_off, s * 0.86, color)
+        drop_color = QColor("#64D2FF")
+        p.setPen(Qt.NoPen)
+        p.setBrush(drop_color)
+        drop_w = max(2.2, s * 0.075)
+        drop_h = max(5.5, s * 0.18)
+        for dx in (-s * 0.18, 0.0, s * 0.18):
+            p.save()
+            p.translate(c.x() + dx, cy_off + s * 0.28)
+            p.rotate(18)
+            p.drawRoundedRect(QRectF(-drop_w / 2, -drop_h / 2, drop_w, drop_h), drop_w / 2, drop_w / 2)
+            p.restore()
+
+    elif icon_type == "snow":
+        cy_off = c.y() - s * 0.10
+        _paint_apple_cloud(p, c.x(), cy_off, s * 0.86, color)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 235))
+        snow_r = max(1.8, s * 0.045)
+        for dx, dy in ((-s * 0.16, s * 0.26), (0.0, s * 0.30), (s * 0.16, s * 0.26)):
+            p.drawEllipse(QPointF(c.x() + dx, cy_off + dy), snow_r, snow_r)
+
+    elif icon_type == "thunder":
+        cy_off = c.y() - s * 0.10
+        _paint_apple_cloud(p, c.x(), cy_off, s * 0.86, color, dark_storm=True)
+        bolt = QPainterPath()
+        bolt.setFillRule(Qt.FillRule.WindingFill)
+        k = s * 0.13
+        bx, by = c.x() - s * 0.02, cy_off + s * 0.16
+        bolt.moveTo(bx + k * 0.25, by)
+        bolt.lineTo(bx - k * 0.50, by + k * 1.05)
+        bolt.lineTo(bx + k * 0.08, by + k * 1.05)
+        bolt.lineTo(bx - k * 0.22, by + k * 2.2)
+        bolt.lineTo(bx + k * 0.60, by + k * 0.90)
+        bolt.lineTo(bx + k * 0.12, by + k * 0.90)
+        bolt.closeSubpath()
+        p.setPen(QPen(QColor("#FFA000"), 0.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(QColor("#FFD60A"))
+        p.drawPath(bolt)
+    else:
+        draw_weather_icon(p, "sun_cloud" if is_day else "moon_cloud", rect, is_day, color)
+
+    p.restore()
+
+
+# ======================= Simple Minimalist Eyes Widget =======================
+class MinimalistEyesWidget(QWidget):
+    """60 FPS Mouse-Tracking & Idle Reaction State Machine (Apple HIG & @ui-ux-pro-max).
+    Procedural vector expressions and 3D parallax tracking in the collapsed notch.
+    - 60 FPS global cursor tracking via math.tanh with 3D perspective scaling.
+    - Mouse shake easter egg: rapid shaking morphs eyes into spinning/wobbling ×  × for 1.5s.
+    - Idle state machine:
+        * Active (<4s): Smooth cursor tracking + natural 130ms blinks.
+        * Playful Idle (4s-12s): Grooving (^  ^  ♪) when music plays, or cycles Happy (^  ^), Side-Eye (—  •), Wink (•  <).
+        * Sleeping (>=12s): Closed breathing slits (—  —) with floating rising zZ particles.
+        * Wake-up Pop: Moving mouse after idle triggers a 200ms startled pop & double-blink.
+    - Smart Apple privacy colors: #FFFFFF (Normal), #30D158 (Camera), #FF9F0A (Mic).
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(140, 32)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # Base geometry
+        self.base_w = 6.5
+        self.base_h = 11.5
+        self.base_radius = 3.2
+        self.eye_gap = 16.0
+
+        # Motion & position tracking
+        self.curr_x = 0.0
+        self.curr_y = 0.0
+        self.target_x = 0.0
+        self.target_y = 0.0
+        self.time_sec = 0.0
+        self.last_pos = QPoint(0, 0)
+        self.idle_time = 0.0
+
+        # State tracking
+        self.cam_active = False
+        self.mic_active = False
+
+        # Shake Easter Egg
+        self.shake_history = []
+        self.dizzy_until = 0.0
+
+        # Wake-up Pop
+        self.wake_pop_until = 0.0
+        self.wake_pop_start = 0.0
+
+        # Blink timing
+        self.next_blink = time.monotonic() + random.uniform(3.5, 5.5)
+        self.blink_start = 0.0
+        self.is_blinking = False
+
+        # Fluid procedural morph targets (interpolated at 60 FPS)
+        self.curr_left_w = self.base_w
+        self.curr_left_h = self.base_h
+        self.curr_right_w = self.base_w
+        self.curr_right_h = self.base_h
+        self.curr_arc = 0.0
+        self.curr_wink = 0.0
+        self.curr_dizzy = 0.0
+        self.curr_sleep = 0.0
+        self.curr_music_note = 0.0
+
+        # 60 FPS main timer
+        self.tick_timer = QTimer(self)
+        self.tick_timer.setInterval(16)
+        self.tick_timer.timeout.connect(self._tick)
+        self.tick_timer.start()
+
+    def set_privacy(self, camera_active, mic_active):
+        if self.cam_active != camera_active or self.mic_active != mic_active:
+            self.cam_active = bool(camera_active)
+            self.mic_active = bool(mic_active)
+            self.update()
+
+    def _is_music_playing(self):
+        try:
+            win = self.window()
+            if hasattr(win, "media"):
+                return bool(getattr(win.media, "has_session", False) and getattr(win.media, "is_playing", False))
+        except Exception:
+            pass
+        return False
+
+    def _tick(self):
+        now = time.monotonic()
+        self.time_sec += 0.016
+
+        # Global mouse position
+        pos = QCursor.pos()
+        dx_move = pos.x() - self.last_pos.x()
+        dy_move = pos.y() - self.last_pos.y()
+        dist = math.hypot(dx_move, dy_move)
+
+        # Mouse Shake Easter Egg detection (4+ reversals of > 22px in 450ms)
+        if abs(dx_move) > 22.0:
+            direction = 1 if dx_move > 0 else -1
+            if not self.shake_history or self.shake_history[-1][1] != direction:
+                self.shake_history.append((now, direction))
+            self.shake_history = [e for e in self.shake_history if now - e[0] <= 0.45]
+            if len(self.shake_history) >= 4:
+                self.dizzy_until = now + 1.5
+                self.shake_history.clear()
+
+        # Idle tracking & Wake-up detection
+        if dist > 3.0:
+            if self.idle_time >= 4.0:
+                # Trigger Startled Wake-Up Pop
+                self.wake_pop_start = now
+                self.wake_pop_until = now + 0.22
+            self.idle_time = 0.0
+            self.last_pos = pos
+        else:
+            self.idle_time += 0.016
+
+        # Determine target morph parameters
+        target_arc = 0.0
+        target_wink = 0.0
+        target_dizzy = 0.0
+        target_sleep = 0.0
+        target_note = 0.0
+
+        target_lw = self.base_w
+        target_rw = self.base_w
+        target_lh = self.base_h
+        target_rh = self.base_h
+
+        # Compute position targets based on state
+        w, h = self.width(), self.height()
+        g_center = self.mapToGlobal(QPoint(int(w / 2), int(h / 2)))
+        dx = pos.x() - g_center.x()
+        dy = pos.y() - g_center.y()
+
+        if self.dizzy_until > now:
+            # State: DIZZY (×  ×)
+            target_dizzy = 1.0
+            self.target_x = math.sin(self.time_sec * 18.0) * 3.5
+            self.target_y = math.cos(self.time_sec * 18.0) * 2.0
+
+        elif self.wake_pop_until > now:
+            # State: WAKE POP
+            t_pop = now - self.wake_pop_start
+            target_lw = target_rw = 7.5
+            target_lh = target_rh = 14.0
+            # Double blink micro-notches
+            if (0.04 <= t_pop <= 0.08) or (0.13 <= t_pop <= 0.17):
+                target_lh = target_rh = 1.8
+            norm_x = math.tanh(dx / 300.0)
+            norm_y = math.tanh(dy / 250.0)
+            self.target_x = norm_x * 12.0
+            self.target_y = norm_y * 4.5
+
+        elif self.idle_time < 4.0:
+            # State A: ACTIVE TRACKING
+            norm_x = math.tanh(dx / 300.0)
+            norm_y = math.tanh(dy / 250.0)
+            self.target_x = norm_x * 12.0
+            self.target_y = norm_y * 4.5
+
+            # Natural 130ms blink
+            if not self.is_blinking and now >= self.next_blink:
+                self.is_blinking = True
+                self.blink_start = now
+            if self.is_blinking:
+                b_prog = (now - self.blink_start) / 0.13
+                if b_prog < 1.0:
+                    blink_factor = math.sin(b_prog * math.pi)
+                    target_lh = target_rh = max(1.5, self.base_h * (1.0 - 0.86 * blink_factor))
+                else:
+                    self.is_blinking = False
+                    self.next_blink = now + random.uniform(3.5, 5.5)
+
+        elif self.idle_time < 12.0:
+            # State B: PLAYFUL IDLE REACTIONS
+            self.target_x = 0.0
+            self.target_y = 0.0
+
+            if self._is_music_playing():
+                # Grooving mode (^  ^  ♪)
+                target_arc = 1.0
+                target_note = 1.0
+                self.target_y = math.sin(self.time_sec * 6.0) * 2.0
+            else:
+                # Cycle every 2.6s through Happy, Side-eye, Wink
+                cycle = int((self.idle_time - 4.0) / 2.6) % 3
+                if cycle == 0:
+                    # Happy arcs (^  ^)
+                    target_arc = 1.0
+                    self.target_y = math.sin(self.time_sec * 4.0) * 1.4
+                elif cycle == 1:
+                    # Suspicious Side-Eye (—  •)
+                    target_lh = 3.5
+                    target_lw = 7.2
+                    target_rh = 12.0
+                    target_rw = 6.5
+                    phase = ((self.idle_time - 4.0) % 2.6) / 2.6
+                    self.target_x = -8.0 if phase < 0.5 else 8.0
+                    self.target_y = 0.0
+                else:
+                    # Playful Wink (•  <)
+                    target_wink = 1.0
+                    target_lh = self.base_h
+                    target_lw = self.base_w
+                    self.target_x = 0.0
+                    self.target_y = 0.0
+
+        else:
+            # State C: SLEEPING / DOZING (—  —  zZ)
+            target_sleep = 1.0
+            target_lw = target_rw = 8.0
+            target_lh = target_rh = 2.2
+            self.target_x = 0.0
+            self.target_y = math.sin(self.time_sec * 2.0) * 1.2
+
+        # 60 FPS exponential lerp smoothing (physics spring feel)
+        lerp_pos = 0.22
+        self.curr_x += (self.target_x - self.curr_x) * lerp_pos
+        self.curr_y += (self.target_y - self.curr_y) * lerp_pos
+
+        lerp_shape = 0.18
+        self.curr_left_w += (target_lw - self.curr_left_w) * lerp_shape
+        self.curr_left_h += (target_lh - self.curr_left_h) * lerp_shape
+        self.curr_right_w += (target_rw - self.curr_right_w) * lerp_shape
+        self.curr_right_h += (target_rh - self.curr_right_h) * lerp_shape
+
+        self.curr_arc += (target_arc - self.curr_arc) * lerp_shape
+        self.curr_wink += (target_wink - self.curr_wink) * lerp_shape
+        self.curr_dizzy += (target_dizzy - self.curr_dizzy) * lerp_shape
+        self.curr_sleep += (target_sleep - self.curr_sleep) * lerp_shape
+        self.curr_music_note += (target_note - self.curr_music_note) * lerp_shape
+
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+        cx = (w / 2.0) + self.curr_x
+        cy = (h * 0.54) + self.curr_y
+
+        lx = cx - 8.0
+        rx = cx + 8.0
+        ly = cy
+        ry = cy
+
+        # 3D Perspective scaling
+        norm_x = max(-1.0, min(1.0, self.curr_x / 12.0))
+        if norm_x >= 0:
+            scale_l = 1.0 - abs(norm_x) * 0.08
+            scale_r = 1.0 + abs(norm_x) * 0.12
+        else:
+            scale_l = 1.0 + abs(norm_x) * 0.12
+            scale_r = 1.0 - abs(norm_x) * 0.08
+
+        lw = self.curr_left_w * scale_l
+        lh = self.curr_left_h * scale_l
+        rw = self.curr_right_w * scale_r
+        rh = self.curr_right_h * scale_r
+
+        # Color coding
+        if self.cam_active:
+            eye_color = QColor("#30D158")
+            glow_color = QColor(48, 209, 88, 75)
+        elif self.mic_active:
+            eye_color = QColor("#FF9F0A")
+            glow_color = QColor(255, 159, 10, 75)
+        else:
+            alpha = int(230 * (1.0 - 0.35 * self.curr_sleep))
+            eye_color = QColor(255, 255, 255, max(80, alpha))
+            glow_color = None
+
+        # Glow in active privacy states
+        if glow_color is not None:
+            p.setPen(Qt.NoPen)
+            p.setBrush(glow_color)
+            p.drawRoundedRect(QRectF(lx - lw/2.0 - 2.5, ly - lh/2.0 - 2.5, lw + 5.0, lh + 5.0), 5.5, 5.5)
+            p.drawRoundedRect(QRectF(rx - rw/2.0 - 2.5, ry - rh/2.0 - 2.5, rw + 5.0, rh + 5.0), 5.5, 5.5)
+
+        # Draw Left Eye
+        if self.curr_dizzy > 0.3:
+            p.save()
+            p.translate(lx, ly)
+            p.rotate(math.sin(self.time_sec * 14.0) * 35.0)
+            p.setPen(QPen(eye_color, 2.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(-4.5, -4.5), QPointF(4.5, 4.5))
+            p.drawLine(QPointF(4.5, -4.5), QPointF(-4.5, 4.5))
+            p.restore()
+        elif self.curr_arc > 0.3:
+            p.save()
+            arc_path = QPainterPath()
+            arc_path.moveTo(lx - 4.5, ly + 2.0)
+            arc_path.quadTo(lx, ly - 4.2, lx + 4.5, ly + 2.0)
+            p.strokePath(arc_path, QPen(eye_color, 2.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.restore()
+        else:
+            p.setPen(Qt.NoPen)
+            p.setBrush(eye_color)
+            r = min(lw / 2.0, lh / 2.0)
+            p.drawRoundedRect(QRectF(lx - lw/2.0, ly - lh/2.0, lw, lh), r, r)
+
+        # Draw Right Eye
+        if self.curr_dizzy > 0.3:
+            p.save()
+            p.translate(rx, ry)
+            p.rotate(-math.sin(self.time_sec * 14.0) * 35.0)
+            p.setPen(QPen(eye_color, 2.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(-4.5, -4.5), QPointF(4.5, 4.5))
+            p.drawLine(QPointF(4.5, -4.5), QPointF(-4.5, 4.5))
+            p.restore()
+        elif self.curr_arc > 0.3:
+            p.save()
+            arc_path = QPainterPath()
+            arc_path.moveTo(rx - 4.5, ry + 2.0)
+            arc_path.quadTo(rx, ry - 4.2, rx + 4.5, ry + 2.0)
+            p.strokePath(arc_path, QPen(eye_color, 2.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.restore()
+        elif self.curr_wink > 0.3:
+            p.save()
+            wink_path = QPainterPath()
+            wink_path.moveTo(rx + 3.8, ry - 4.2)
+            wink_path.lineTo(rx - 3.2, ry)
+            wink_path.lineTo(rx + 3.8, ry + 4.2)
+            p.strokePath(wink_path, QPen(eye_color, 2.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.restore()
+        else:
+            p.setPen(Qt.NoPen)
+            p.setBrush(eye_color)
+            r = min(rw / 2.0, rh / 2.0)
+            p.drawRoundedRect(QRectF(rx - rw/2.0, ry - rh/2.0, rw, rh), r, r)
+
+        # Grooving Music Note (♪)
+        if self.curr_music_note > 0.1:
+            p.save()
+            note_opacity = max(0.0, min(1.0, self.curr_music_note * (0.65 + 0.35 * math.sin(self.time_sec * 5.0))))
+            p.setOpacity(note_opacity)
+            nx = rx + 12.0
+            ny = ry - 2.5 + math.sin(self.time_sec * 6.0) * 1.5
+            p.translate(nx, ny)
+            p.setPen(Qt.NoPen)
+            p.setBrush(eye_color)
+            p.rotate(-20)
+            p.drawEllipse(QRectF(-2.2, -1.6, 4.4, 3.2))
+            p.rotate(20)
+            p.setPen(QPen(eye_color, 1.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(1.8, 0.0), QPointF(1.8, -6.5))
+            flag_p = QPainterPath()
+            flag_p.moveTo(1.8, -6.5)
+            flag_p.quadTo(4.5, -5.5, 4.0, -2.5)
+            p.strokePath(flag_p, QPen(eye_color, 1.2, Qt.SolidLine, Qt.RoundCap))
+            p.restore()
+
+        # Sleeping Floating 'z' / 'Z' Particles
+        if self.curr_sleep > 0.1:
+            p.save()
+            t1 = (self.time_sec) % 2.2
+            frac1 = t1 / 2.2
+            alpha1 = max(0.0, min(1.0, math.sin(frac1 * math.pi) * 0.75 * self.curr_sleep))
+            z1_x = rx + 7.5 + math.sin(frac1 * 4.0) * 2.0
+            z1_y = ry - 2.0 - frac1 * 10.0
+            font_z1 = QFont("Segoe UI", 6)
+            font_z1.setBold(True)
+            p.setFont(font_z1)
+            p.setPen(QColor(255, 255, 255, int(alpha1 * 255)))
+            p.drawText(QPointF(z1_x, z1_y), "z")
+
+            t2 = (self.time_sec + 1.1) % 2.2
+            frac2 = t2 / 2.2
+            alpha2 = max(0.0, min(1.0, math.sin(frac2 * math.pi) * 0.75 * self.curr_sleep))
+            z2_x = rx + 13.0 + math.sin(frac2 * 4.0) * 2.5
+            z2_y = ry - 4.0 - frac2 * 12.0
+            font_z2 = QFont("Segoe UI", 8)
+            font_z2.setBold(True)
+            p.setFont(font_z2)
+            p.setPen(QColor(255, 255, 255, int(alpha2 * 255)))
+            p.drawText(QPointF(z2_x, z2_y), "Z")
+            p.restore()
+
+
+# ======================= Notification Center Page =======================
+def format_relative_time(ts):
+    if not ts or ts <= 0:
+        return "now"
+    diff = max(0, int(time.time() - ts))
+    if diff < 60:
+        return "now"
+    elif diff < 3600:
+        return f"{diff // 60}m ago"
+    elif diff < 86400:
+        return f"{diff // 3600}h ago"
+    else:
+        return f"{diff // 86400}d ago"
+
+
+class WindowsNotificationWorker(QObject):
+    """Background worker querying Windows wpndatabase.db every 2.0s without locking."""
+    notifications_updated = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self._last_mtime = 0.0
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _parse_app_info(self, primary_id):
+        if not primary_id:
+            return ("System", "#0A84FF", "bell")
+        pid_lower = primary_id.lower()
+        if "whatsapp" in pid_lower:
+            return ("WhatsApp", "#25D366", "whatsapp")
+        elif "brave" in pid_lower:
+            return ("Brave", "#FB542B", "bell")
+        elif "chrome" in pid_lower:
+            return ("Chrome", "#0A84FF", "bell")
+        elif "discord" in pid_lower:
+            return ("Discord", "#5865F2", "bell")
+        elif "telegram" in pid_lower:
+            return ("Telegram", "#2AABEE", "whatsapp")
+        elif "slack" in pid_lower:
+            return ("Slack", "#4A154B", "bell")
+        elif "spotify" in pid_lower:
+            return ("Spotify", "#1DB954", "bell")
+        elif "screensketch" in pid_lower or "snippingtool" in pid_lower:
+            return ("Snipping Tool", "#0A84FF", "bell")
+        elif "defender" in pid_lower or "securitycenter" in pid_lower:
+            return ("Windows Security", "#0A84FF", "bell")
+        elif "visualstudiocode" in pid_lower or "vscode" in pid_lower:
+            return ("VS Code", "#007ACC", "bell")
+        elif "outlook" in pid_lower or "mail" in pid_lower:
+            return ("Mail", "#0078D4", "bell")
+
+        clean = primary_id
+        if "!" in clean:
+            clean = clean.split("!")[0]
+        if "_" in clean:
+            clean = clean.split("_")[0]
+        parts = clean.replace("\\", ".").split(".")
+        candidate = [p for p in parts if p.lower() not in ("microsoft", "windows", "app", "exe")]
+        name = candidate[-1] if candidate else parts[-1]
+        return (name.capitalize() if name.islower() else name, "#0A84FF", "bell")
+
+    def _fetch_notifications(self):
+        db_dir = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Notifications")
+        db_path = os.path.join(db_dir, "wpndatabase.db")
+        wal_path = os.path.join(db_dir, "wpndatabase.db-wal")
+        shm_path = os.path.join(db_dir, "wpndatabase.db-shm")
+
+        if not os.path.exists(db_path):
+            return []
+
+        tmp_dir = tempfile.gettempdir()
+        tmp_db = os.path.join(tmp_dir, "island_live_wpn.db")
+        tmp_wal = os.path.join(tmp_dir, "island_live_wpn.db-wal")
+        tmp_shm = os.path.join(tmp_dir, "island_live_wpn.db-shm")
+
+        try:
+            shutil.copy2(db_path, tmp_db)
+            if os.path.exists(wal_path):
+                shutil.copy2(wal_path, tmp_wal)
+            elif os.path.exists(tmp_wal):
+                try: os.remove(tmp_wal)
+                except Exception: pass
+
+            if os.path.exists(shm_path):
+                shutil.copy2(shm_path, tmp_shm)
+            elif os.path.exists(tmp_shm):
+                try: os.remove(tmp_shm)
+                except Exception: pass
+
+            conn = sqlite3.connect(tmp_db)
+            c = conn.cursor()
+            query = """
+            SELECT n.Id, nh.PrimaryId, n.Payload, n.ArrivalTime
+            FROM Notification n
+            LEFT JOIN NotificationHandler nh ON n.HandlerId = nh.RecordId
+            WHERE n.Type = 'toast' AND n.Payload IS NOT NULL
+            ORDER BY n.ArrivalTime DESC
+            LIMIT 20
+            """
+            c.execute(query)
+            rows = c.fetchall()
+            conn.close()
+
+            results = []
+            for r in rows:
+                n_id, primary_id, payload, arrival_time = r
+                if not payload:
+                    continue
+                if isinstance(payload, bytes):
+                    payload_str = payload.decode("utf-8", errors="ignore")
+                else:
+                    payload_str = str(payload)
+
+                try:
+                    root = ET.fromstring(payload_str)
+                    texts = [el.text.strip() for el in root.iter("text") if el.text and el.text.strip()]
+                except Exception:
+                    continue
+
+                if not texts:
+                    continue
+
+                title = texts[0]
+                preview = " — ".join(texts[1:]) if len(texts) > 1 else ""
+                app_name, badge_color, icon_type = self._parse_app_info(primary_id)
+                unix_ts = (arrival_time / 10_000_000) - 11644473600
+
+                results.append({
+                    "id": int(n_id),
+                    "app": app_name,
+                    "sender": title,
+                    "preview": preview,
+                    "timestamp": unix_ts,
+                    "color": badge_color,
+                    "icon": icon_type,
+                })
+            return results
+        except Exception:
+            return []
+
+    def _run_loop(self):
+        db_dir = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Notifications")
+        db_path = os.path.join(db_dir, "wpndatabase.db")
+        wal_path = os.path.join(db_dir, "wpndatabase.db-wal")
+
+        while self._running:
+            try:
+                mtime = 0.0
+                if os.path.exists(db_path):
+                    mtime = max(mtime, os.path.getmtime(db_path))
+                if os.path.exists(wal_path):
+                    mtime = max(mtime, os.path.getmtime(wal_path))
+
+                if mtime != self._last_mtime or self._last_mtime == 0.0:
+                    self._last_mtime = mtime
+                    notifs = self._fetch_notifications()
+                    self.notifications_updated.emit(notifs)
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+
+class NotificationCard(QFrame):
+    """Stacked rounded notification pill (height: 52px, border-radius: 16px)."""
+    clicked = Signal(int)
+
+    def __init__(self, data, is_unread=True, parent=None):
+        super().__init__(parent)
+        self.data = data
+        self.is_unread = is_unread
+        self.setFixedHeight(52)
+        self.setCursor(Qt.PointingHandCursor)
+        self.hover = 0.0
+        self.hover_anim = anim(self, 140, self._set_hover)
+
+    def _set_hover(self, v):
+        self.hover = float(v)
+        self.update()
+
+    def enterEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 1.0)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 0.0)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.data.get("id", 0))
+        super().mousePressEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        w, h = self.width(), self.height()
+        r = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+
+        alpha = int(16 + 14 * self.hover)
+        border_alpha = int(22 + 20 * self.hover)
+        p.setBrush(QColor(255, 255, 255, alpha))
+        p.setPen(QPen(QColor(255, 255, 255, border_alpha), 1.0))
+        p.drawRoundedRect(r, 16, 16)
+
+        # 34x34px circular app badge on left
+        badge_rect = QRectF(9, 9, 34, 34)
+        badge_color = QColor(self.data.get("color", "#0A84FF"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(badge_color)
+        p.drawEllipse(badge_rect)
+
+        icon_type = self.data.get("icon", "bell")
+        if icon_type == "whatsapp":
+            draw_apple_bubble_fill(p, badge_rect, "#FFFFFF")
+        else:
+            draw_apple_bell_fill(p, badge_rect, "#FFFFFF")
+
+        tx = 52.0
+        dot_reserved = 24.0 if self.is_unread else 14.0
+        avail_w = w - tx - dot_reserved
+
+        time_str = format_relative_time(self.data.get("timestamp", 0))
+        f_cap = QFont("Segoe UI", 8)
+        p.setFont(f_cap)
+        p.setPen(QColor(255, 255, 255, 130))
+        cap_text = f"{self.data.get('app', '')} · {time_str}"
+        p.drawText(QRectF(tx, 8, avail_w, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, cap_text)
+
+        f_msg = QFont("Segoe UI", 9)
+        f_msg.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f_msg)
+        p.setPen(QColor(255, 255, 255, 225))
+        sender = self.data.get("sender", "")
+        preview = self.data.get("preview", "")
+        full_line = f"{sender}: {preview}" if (sender and preview) else (sender or preview)
+        fm = p.fontMetrics()
+        elided = fm.elidedText(full_line, Qt.TextElideMode.ElideRight, int(avail_w))
+        p.drawText(QRectF(tx, 24, avail_w, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
+
+        if self.is_unread:
+            dot_cx = w - 16.0
+            dot_cy = h / 2.0
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#0A84FF"))
+            p.drawEllipse(QPointF(dot_cx, dot_cy), 3.5, 3.5)
+
+
+class NotificationEmptyStateWidget(QWidget):
+    """Clean @apple-design empty state centered in the card area."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(110)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        w, h = self.width(), self.height()
+
+        bell_rect = QRectF((w - 26) / 2.0, 20, 26, 26)
+        draw_apple_bell_fill(p, bell_rect, QColor(255, 255, 255, 60))
+
+        f = QFont("Segoe UI", 9)
+        f.setWeight(QFont.Weight.Medium)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 115))
+        p.drawText(QRectF(0, 56, w, 20), Qt.AlignmentFlag.AlignCenter, "No new notifications")
+
+
+class NotificationScrollArea(QScrollArea):
+    """ScrollArea for notifications with hidden scrollbars and intercepted wheelEvent."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def wheelEvent(self, e):
+        super().wheelEvent(e)
+        e.accept()
+
+
+class NotificationPage(QWidget):
+    """Notification Center Carousel Page (Apple HIG & @ui-ux-pro-max).
+    - Compact sub-header row (22px): vector bell (14x14) + unread count badge + 'Read all' & 'Clear' buttons.
+    - Real Windows 10/11 live notifications read from wpndatabase.db.
+    - Zero fake/hardcoded demo notifications.
+    - Apple empty state when empty or cleared.
+    - Scrollable card container with intercepted mouse wheel so scrolling never switches Island pages.
+    - Window height budget: extra_height = 86 (expanded height 244px).
+    """
+    title = "Notification"
+    extra_height = 86
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.all_notifications = []
+        self.read_ids = set()
+        self.cleared_ids = set()
+        self.cleared_before_time = 0.0
+
+        self._build_ui()
+
+        self.worker = WindowsNotificationWorker(self)
+        self.worker.notifications_updated.connect(self._on_notifications_updated)
+
+    def _build_ui(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(18, 10, 18, 10)
+        vbox.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(2, 0, 2, 0)
+        header_row.setSpacing(6)
+
+        bell_w = QWidget()
+        bell_w.setFixedSize(14, 14)
+        bell_w.paintEvent = lambda e: (lambda p: (draw_apple_bell_fill(p, QRectF(0, 0, 14, 14), "#FFFFFF"), p.end()))(QPainter(bell_w))
+
+        self.badge_lbl = QLabel("0")
+        self.badge_lbl.setFixedSize(18, 18)
+        self.badge_lbl.setAlignment(Qt.AlignCenter)
+        self.badge_lbl.setStyleSheet("""
+            background-color: #0A84FF;
+            color: #FFFFFF;
+            font-size: 10px;
+            font-weight: 700;
+            border-radius: 9px;
+        """)
+
+        self.unread_sub_lbl = QLabel("Unread")
+        self.unread_sub_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: rgba(255, 255, 255, 0.65);")
+
+        header_row.addWidget(bell_w)
+        header_row.addWidget(self.badge_lbl)
+        header_row.addWidget(self.unread_sub_lbl)
+        header_row.addStretch()
+
+        btn_style = """
+            QPushButton {
+                background: transparent;
+                color: rgba(255, 255, 255, 0.65);
+                font-size: 11px;
+                font-weight: 600;
+                border: none;
+                border-radius: 9px;
+                padding: 2px 8px;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.10);
+                color: #FFFFFF;
+            }
+        """
+        self.read_all_btn = QPushButton("Read all")
+        self.read_all_btn.setFixedHeight(22)
+        self.read_all_btn.setCursor(Qt.PointingHandCursor)
+        self.read_all_btn.setStyleSheet(btn_style)
+        self.read_all_btn.clicked.connect(self.read_all)
+
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFixedHeight(22)
+        self.clear_btn.setCursor(Qt.PointingHandCursor)
+        self.clear_btn.setStyleSheet(btn_style)
+        self.clear_btn.clicked.connect(self.clear_all)
+
+        header_row.addWidget(self.read_all_btn)
+        header_row.addWidget(self.clear_btn)
+        vbox.addLayout(header_row)
+
+        # Empty state widget
+        self.empty_widget = NotificationEmptyStateWidget(self)
+        vbox.addWidget(self.empty_widget)
+
+        # Scrollable container for cards
+        self.scroll_area = NotificationScrollArea(self)
+        self.scroll_content = QWidget()
+        self.cards_layout = QVBoxLayout(self.scroll_content)
+        self.cards_layout.setContentsMargins(0, 2, 0, 2)
+        self.cards_layout.setSpacing(8)
+        self.cards_layout.addStretch()
+        self.scroll_area.setWidget(self.scroll_content)
+        vbox.addWidget(self.scroll_area)
+
+        self._refresh_cards()
+
+    def _get_active_notifications(self):
+        active = []
+        for n in self.all_notifications:
+            n_id = n.get("id")
+            ts = n.get("timestamp", 0)
+            if n_id in self.cleared_ids:
+                continue
+            if ts <= self.cleared_before_time:
+                continue
+            active.append(n)
+        return active
+
+    def _on_notifications_updated(self, notifs):
+        self.all_notifications = notifs
+        self._refresh_cards()
+
+    def _refresh_cards(self):
+        while self.cards_layout.count() > 1:
+            item = self.cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        active = self._get_active_notifications()
+        unread_count = sum(1 for n in active if n.get("id") not in self.read_ids)
+
+        if unread_count > 0:
+            self.badge_lbl.setText(str(unread_count))
+            self.badge_lbl.show()
+            self.unread_sub_lbl.show()
+        else:
+            self.badge_lbl.setText("0")
+            self.badge_lbl.hide()
+            self.unread_sub_lbl.hide()
+
+        if not active:
+            self.scroll_area.hide()
+            self.empty_widget.show()
+        else:
+            self.empty_widget.hide()
+            self.scroll_area.show()
+            for data in active:
+                is_unread = data.get("id") not in self.read_ids
+                card = NotificationCard(data, is_unread=is_unread, parent=self.scroll_content)
+                card.clicked.connect(self._on_card_clicked)
+                self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+
+    def _on_card_clicked(self, notif_id):
+        self.read_ids.add(notif_id)
+        self._refresh_cards()
+
+    def read_all(self):
+        for n in self._get_active_notifications():
+            self.read_ids.add(n.get("id"))
+        self._refresh_cards()
+
+    def clear_all(self):
+        self.cleared_before_time = time.time()
+        for n in self.all_notifications:
+            self.cleared_ids.add(n.get("id"))
+        self._refresh_cards()
+
+
+# ======================= Immersive Weather Page =======================
+class WeatherHeroIconWidget(QWidget):
+    """46x46px custom painted weather hero icon."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(46, 46)
+        self.icon_type = "sun_cloud"
+        self.is_day = True
+
+    def set_icon(self, icon_type, is_day=True):
+        self.icon_type = icon_type
+        self.is_day = is_day
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        draw_weather_icon(p, self.icon_type, self.rect(), is_day=self.is_day)
+
+
+class DaylightGlyphWidget(QWidget):
+    """Mini Apple SF sunrise / sunset glyph (16x14px)."""
+    def __init__(self, is_sunrise=True, parent=None):
+        super().__init__(parent)
+        self.is_sunrise = is_sunrise
+        self.setFixedSize(16, 14)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        c_x = w / 2.0
+        horizon_y = h - 3.0
+
+        # Horizon bar (clean translucent white line)
+        p.setPen(QPen(QColor(255, 255, 255, 170), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(1.0, horizon_y), QPointF(w - 1.0, horizon_y))
+
+        # Sun semi-circle
+        sun_r = 3.6
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFD60A"))
+        sun_path = QPainterPath()
+        sun_path.setFillRule(Qt.FillRule.WindingFill)
+        sun_path.arcMoveTo(c_x - sun_r, horizon_y - sun_r, sun_r * 2, sun_r * 2, 0)
+        sun_path.arcTo(c_x - sun_r, horizon_y - sun_r, sun_r * 2, sun_r * 2, 0, 180)
+        sun_path.closeSubpath()
+        p.drawPath(sun_path)
+
+        # Arrow indicator (Up for sunrise, Down for sunset)
+        p.setPen(QPen(QColor(255, 255, 255, 220), 1.1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if self.is_sunrise:
+            p.drawLine(QPointF(c_x, 1.5), QPointF(c_x, 5.0))
+            p.drawLine(QPointF(c_x - 2.0, 3.2), QPointF(c_x, 1.5))
+            p.drawLine(QPointF(c_x + 2.0, 3.2), QPointF(c_x, 1.5))
+        else:
+            p.drawLine(QPointF(c_x, 1.5), QPointF(c_x, 5.0))
+            p.drawLine(QPointF(c_x - 2.0, 3.3), QPointF(c_x, 5.0))
+            p.drawLine(QPointF(c_x + 2.0, 3.3), QPointF(c_x, 5.0))
+
+
+class ForecastCapsule(QFrame):
+    """Frosted Glass Forecast Capsule (Apple HIG).
+    fixedHeight: 78px, border-radius: 14px, background: rgba(255,255,255,0.18), border: 1px solid rgba(255,255,255,0.25).
+    Day label (10.5px Bold #FFFFFF), 20x20px weather icon with WindingFill, High temp (12px Bold #FFFFFF) and Low temp (9.5px rgba(..., 0.70)).
+    """
+    def __init__(self, day_label="Today", icon="sun", high="27°", low="16°", is_day=True, parent=None):
+        super().__init__(parent)
+        self.day_label = day_label
+        self.icon_type = icon
+        self.high_temp = high
+        self.low_temp = low
+        self.is_day = is_day
+        self.hover = 0.0
+        self.setFixedHeight(78)
+        self.setCursor(Qt.PointingHandCursor)
+        self.hover_anim = anim(self, 140, self._set_hover)
+
+    def _set_hover(self, v):
+        self.hover = float(v)
+        self.update()
+
+    def enterEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 1.0)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        run_anim(self.hover_anim, self.hover, 0.0)
+        super().leaveEvent(e)
+
+    def update_data(self, day, icon, high, low, is_day=True):
+        self.day_label = day
+        self.icon_type = icon
+        self.high_temp = high
+        self.low_temp = low
+        self.is_day = is_day
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        w, h = self.width(), self.height()
+        r = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+
+        bg_alpha = int(46 + 22 * self.hover)
+        border_alpha = int(60 + 25 * self.hover)
+        p.setBrush(QColor(255, 255, 255, bg_alpha))
+        p.setPen(QPen(QColor(255, 255, 255, border_alpha), 1.0))
+        p.drawRoundedRect(r, 14, 14)
+
+        # Day label (10.5px Bold #FFFFFF)
+        f_day = QFont("Segoe UI", 9)
+        f_day.setWeight(QFont.Weight.Bold)
+        p.setFont(f_day)
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(QRectF(0, 5, w, 14), Qt.AlignmentFlag.AlignCenter, self.day_label)
+
+        # Weather icon (20x20px) centered
+        icon_rect = QRectF((w - 20) / 2.0, 21, 20, 20)
+        draw_weather_icon(p, self.icon_type, icon_rect, is_day=self.is_day)
+
+        # High temp (12px bold #FFFFFF)
+        f_hi = QFont("Segoe UI", 9)
+        f_hi.setWeight(QFont.Weight.Bold)
+        p.setFont(f_hi)
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(QRectF(0, 44, w, 15), Qt.AlignmentFlag.AlignCenter, self.high_temp)
+
+        # Low temp (9.5px rgba(255, 255, 255, 0.70))
+        f_lo = QFont("Segoe UI", 8)
+        f_lo.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f_lo)
+        p.setPen(QColor(255, 255, 255, 180))
+        p.drawText(QRectF(0, 60, w, 13), Qt.AlignmentFlag.AlignCenter, self.low_temp)
+
+
+class WeatherFetcher(QObject):
+    """Background weather data fetcher from Open-Meteo API."""
+    done = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = None
+
+    def fetch(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        url = ("https://api.open-meteo.com/v1/forecast?"
+               "latitude=34.03&longitude=-5.00&current=temperature_2m,weather_code,is_day&"
+               "daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset&timezone=auto")
+        data = None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "IslandWidget/2.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            pass
+
+        def map_wmo(code, is_day=1):
+            if code == 0:
+                return ("Clear" if is_day else "Clear Night", "sun" if is_day else "moon")
+            elif code in (1, 2):
+                return ("Partly Cloudy", "sun_cloud" if is_day else "moon_cloud")
+            elif code == 3:
+                return ("Overcast", "cloud")
+            elif code in (45, 48):
+                return ("Foggy", "cloud")
+            elif code in (51, 53, 55, 56, 57):
+                return ("Drizzle", "rain")
+            elif code in (61, 63, 65, 66, 67, 80, 81, 82):
+                return ("Rain", "rain")
+            elif code in (71, 73, 75, 77, 85, 86):
+                return ("Snow", "snow")
+            elif code in (95, 96, 99):
+                return ("Thunderstorm", "thunder")
+            return ("Fair", "sun_cloud" if is_day else "moon_cloud")
+
+        use_f = (CFG.get("weather_unit", 0) == 1)
+
+        def to_temp(c_val):
+            if c_val is None:
+                return "75°F" if use_f else "24°C"
+            return f"{round(c_val * 9/5 + 32)}°F" if use_f else f"{round(c_val)}°C"
+
+        def to_deg(c_val, fallback=20):
+            v = c_val if c_val is not None else fallback
+            return f"{round(v * 9/5 + 32)}°" if use_f else f"{round(v)}°"
+
+        if data and "current" in data and "daily" in data:
+            cur = data["current"]
+            daily = data["daily"]
+            is_day = bool(cur.get("is_day", 1))
+            cond_str, icon_name = map_wmo(cur.get("weather_code", 0), is_day)
+            temp_display = to_temp(cur.get("temperature_2m", 24))
+
+            sr_raw = daily.get("sunrise", ["2026-11-08T06:45"])[0]
+            ss_raw = daily.get("sunset", ["2026-11-08T17:21"])[0]
+            sr_str = sr_raw.split("T")[-1][:5]
+            ss_str = ss_raw.split("T")[-1][:5]
+
+            try:
+                t1 = datetime.datetime.strptime(sr_str, "%H:%M")
+                t2 = datetime.datetime.strptime(ss_str, "%H:%M")
+                diff = t2 - t1
+                hours = diff.seconds // 3600
+                mins = (diff.seconds % 3600) // 60
+                duration_str = f"{hours} h {mins} m"
+            except Exception:
+                duration_str = "10 h 36 m"
+
+            forecast = []
+            dates = daily.get("time", [])
+            wcodes = daily.get("weather_code", [])
+            tmax = daily.get("temperature_2m_max", [])
+            tmin = daily.get("temperature_2m_min", [])
+            for i in range(min(6, len(dates))):
+                if i == 0:
+                    day_lbl = "Today"
+                else:
+                    try:
+                        day_lbl = datetime.datetime.fromisoformat(dates[i]).strftime("%a")
+                    except Exception:
+                        day_lbl = f"D+{i}"
+                _, f_icon = map_wmo(wcodes[i] if i < len(wcodes) else 0, 1)
+                hi = to_deg(tmax[i] if i < len(tmax) else None, 25)
+                lo = to_deg(tmin[i] if i < len(tmin) else None, 15)
+                forecast.append({
+                    "day": day_lbl,
+                    "icon": f_icon,
+                    "high": hi,
+                    "low": lo,
+                    "is_day": True
+                })
+
+            result = {
+                "condition": cond_str,
+                "icon": icon_name,
+                "temp": temp_display,
+                "city": CFG.get("city") or "Fez",
+                "is_day": is_day,
+                "sunrise": sr_str,
+                "sunset": ss_str,
+                "daylight": duration_str,
+                "forecast": forecast
+            }
+        else:
+            # High-fidelity realistic fallback (Morocco / Fez)
+            now = datetime.datetime.now()
+            is_day = 6 <= now.hour < 18
+            weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            forecast = [
+                {"day": "Today", "icon": "sun_cloud" if is_day else "moon_cloud", "high": to_deg(27), "low": to_deg(16), "is_day": is_day},
+                {"day": weekdays[(now.weekday() + 1) % 7], "icon": "thunder", "high": to_deg(21), "low": to_deg(17), "is_day": True},
+                {"day": weekdays[(now.weekday() + 2) % 7], "icon": "cloud", "high": to_deg(24), "low": to_deg(16), "is_day": True},
+                {"day": weekdays[(now.weekday() + 3) % 7], "icon": "sun", "high": to_deg(25), "low": to_deg(14), "is_day": True},
+                {"day": weekdays[(now.weekday() + 4) % 7], "icon": "rain", "high": to_deg(22), "low": to_deg(15), "is_day": True},
+                {"day": weekdays[(now.weekday() + 5) % 7], "icon": "sun_cloud", "high": to_deg(24), "low": to_deg(16), "is_day": True},
+            ]
+            result = {
+                "condition": "Partly Cloudy" if is_day else "Clear Night",
+                "icon": "sun_cloud" if is_day else "moon_cloud",
+                "temp": to_temp(25),
+                "city": CFG.get("city") or "Fez",
+                "is_day": is_day,
+                "sunrise": "06:45",
+                "sunset": "17:21",
+                "daylight": "10 h 36 m",
+                "forecast": forecast
+            }
+        try:
+            self.done.emit(result)
+        except (RuntimeError, Exception):
+            pass
+
+
+class WeatherPage(QWidget):
+    """Immersive Weather Carousel Page (Apple HIG & @ui-ux-pro-max).
+    - Upper Section: 44x44px vector weather icon, condition & temp ('Overcast 26°C' / 18px ExtraBold), city, day & time.
+    - Daylight Row: single 1px divider, Apple SF sunrise glyph & time on left, daylight span pill in center, sunset time & glyph on right.
+    - 6-Day Frosted Forecast Capsules: 78px height, 14px radius, 1px border with day, 20x20 icon, high/low stacked with zero clipping.
+    - Window height budget: extra_height = 86 (expanded height 244px).
+    """
+    title = "Weather"
+    extra_height = 86
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.is_day = True
+        self.capsules = []
+
+        self._build_ui()
+
+        self.fetcher = WeatherFetcher(self)
+        self.fetcher.done.connect(self.set_weather_data)
+        self.fetcher.fetch()
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(20 * 60 * 1000)
+        self.poll_timer.timeout.connect(self.fetcher.fetch)
+        self.poll_timer.start()
+
+    def _build_ui(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(14, 4, 14, 6)
+        vbox.setSpacing(4)
+
+        # Upper row
+        upper = QHBoxLayout()
+        upper.setContentsMargins(2, 0, 2, 0)
+        upper.setSpacing(12)
+
+        self.hero_icon = WeatherHeroIconWidget(self)
+        self.hero_icon.setFixedSize(44, 44)
+        upper.addWidget(self.hero_icon)
+
+        meta_v = QVBoxLayout()
+        meta_v.setContentsMargins(0, 0, 0, 0)
+        meta_v.setSpacing(1)
+
+        self.day_time_lbl = QLabel(datetime.datetime.now().strftime("%A, %H:%M"))
+        self.day_time_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.78); font-size: 10px; font-weight: 500;")
+
+        self.cond_temp_lbl = QLabel("Partly Cloudy 25°C")
+        self.cond_temp_lbl.setStyleSheet("color: #FFFFFF; font-size: 18px; font-weight: 800; letter-spacing: -0.3px;")
+
+        self.city_lbl = QLabel(CFG.get("city") or "Fez")
+        self.city_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.85); font-size: 11px; font-weight: 600;")
+
+        meta_v.addWidget(self.day_time_lbl)
+        meta_v.addWidget(self.cond_temp_lbl)
+        meta_v.addWidget(self.city_lbl)
+        upper.addLayout(meta_v, 1)
+
+        vbox.addLayout(upper)
+
+        # Single clean 1px divider (rgba(255,255,255,0.20))
+        divider = QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet("background-color: rgba(255, 255, 255, 0.22); border: none;")
+        vbox.addWidget(divider)
+
+        # Daylight Row with Apple SF glyphs
+        daylight_row = QHBoxLayout()
+        daylight_row.setContentsMargins(4, 1, 4, 1)
+        daylight_row.setSpacing(6)
+
+        self.sunrise_icon = DaylightGlyphWidget(is_sunrise=True, parent=self)
+        self.sunrise_lbl = QLabel("06:45")
+        self.sunrise_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.88); font-size: 10px; font-weight: 600; font-family: 'Segoe UI', monospace; border: none; background: transparent;")
+
+        self.daylight_span_lbl = QLabel("10 h 36 m daylight")
+        self.daylight_span_lbl.setAlignment(Qt.AlignCenter)
+        self.daylight_span_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.72); font-size: 10px; font-weight: 500; border: none; background: transparent;")
+
+        self.sunset_lbl = QLabel("17:21")
+        self.sunset_lbl.setAlignment(Qt.AlignRight)
+        self.sunset_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.88); font-size: 10px; font-weight: 600; font-family: 'Segoe UI', monospace; border: none; background: transparent;")
+        self.sunset_icon = DaylightGlyphWidget(is_sunrise=False, parent=self)
+
+        daylight_row.addWidget(self.sunrise_icon)
+        daylight_row.addWidget(self.sunrise_lbl)
+        daylight_row.addWidget(self.daylight_span_lbl, 1)
+        daylight_row.addWidget(self.sunset_lbl)
+        daylight_row.addWidget(self.sunset_icon)
+        vbox.addLayout(daylight_row)
+
+        # 6-Day Frosted Forecast Capsules Row
+        self.capsules_row = QHBoxLayout()
+        self.capsules_row.setContentsMargins(0, 0, 0, 0)
+        self.capsules_row.setSpacing(6)
+
+        for _ in range(6):
+            cap = ForecastCapsule()
+            self.capsules.append(cap)
+            self.capsules_row.addWidget(cap)
+
+        vbox.addLayout(self.capsules_row)
+
+    def set_weather_data(self, data):
+        try:
+            self.is_day = data.get("is_day", True)
+            self.hero_icon.set_icon(data.get("icon", "sun_cloud"), is_day=self.is_day)
+
+            cond = data.get("condition", "Partly Cloudy")
+            temp = data.get("temp", "25°C")
+            self.cond_temp_lbl.setText(f"{cond} {temp}")
+            self.city_lbl.setText(data.get("city", "Fez"))
+            self.day_time_lbl.setText(datetime.datetime.now().strftime("%A, %H:%M"))
+
+            self.sunrise_lbl.setText(data.get("sunrise", "06:45"))
+            self.sunset_lbl.setText(data.get("sunset", "17:21"))
+            dl_text = data.get("daylight", "10 h 36 m")
+            self.daylight_span_lbl.setText(f"{dl_text} daylight" if "daylight" not in dl_text else dl_text)
+
+            f_list = data.get("forecast", [])
+            for i, cap in enumerate(self.capsules):
+                if i < len(f_list):
+                    item = f_list[i]
+                    cap.update_data(item.get("day", ""), item.get("icon", "sun"),
+                                    item.get("high", "25°"), item.get("low", "15°"),
+                                    is_day=item.get("is_day", True))
+                    cap.show()
+                else:
+                    cap.hide()
+
+            p = self.parent()
+            while p and not hasattr(p, "sync_ambient_glow"):
+                p = p.parent()
+            if p and hasattr(p, "sync_ambient_glow"):
+                p.sync_ambient_glow(animate=False)
+        except Exception:
+            pass
+
+
 class Island(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(STYLE)
+        self.theme = CFG.get("theme", "dark")
         self.state = "pill"          # 'full', 'pill' or 'line'
         self.notified = set()
         self.alert_glow = 0.0
+        self._auto_expanded_for_privacy = False
 
-        # collapsed pill
+        # collapsed pill with Simple Minimalist Eyes
         self.mini = QWidget()
+        self.mini.setFixedHeight(32)
         ml = QHBoxLayout(self.mini)
-        ml.setContentsMargins(18, 0, 18, 2)
-        self.mini_left = QLabel(textFormat=Qt.RichText)
-        self.mini_left.setStyleSheet("font-weight: 700;")
-        self.mini_right = QLabel(textFormat=Qt.RichText)
-        ml.addWidget(self.mini_left); ml.addStretch(); ml.addWidget(self.mini_right)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(0)
+        self.eyes = MinimalistEyesWidget(self.mini)
+        ml.addWidget(self.eyes)
+
+        self.mini_left = QLabel(self.mini)
+        self.mini_left.hide()
+        self.mini_right = QLabel(self.mini)
+        self.mini_right.hide()
+        self.mini_privacy_dot = MiniPrivacyDot(self.mini)
+        self.mini_privacy_dot.hide()
 
         # expanded card
         self.full = QWidget()
@@ -3975,6 +6837,10 @@ class Island(QWidget):
         self.date_lbl.setAlignment(Qt.AlignCenter)
         self.date_lbl.setStyleSheet("color: rgba(255, 255, 255, 165); font-size: 12px;")
 
+        # Apple Dynamic Island Privacy Pill (Stage 2)
+        self.privacy_pill = PrivacyHeaderPill(self)
+        self.privacy_pill.clicked.connect(self._toggle_privacy_banner)
+
         self.clock_lbl = QLabel()
         self.clock_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
         self.clock_lbl.setFixedWidth(68)
@@ -3984,23 +6850,32 @@ class Island(QWidget):
         gear = AppleButton("gear", "ghost", 28, "Settings")
         gear.clicked.connect(self.open_settings)
 
-        # Balance left (104px) == right (68 + 8 + 28 = 104px) so date_lbl is dead-center
         header.addWidget(self.title_lbl)
         header.addStretch()
         header.addWidget(self.date_lbl)
         header.addStretch()
+        header.addWidget(self.privacy_pill)
         header.addWidget(self.clock_lbl)
         header.addSpacing(2)
         header.addWidget(gear)
 
+        # Stage 1 Live Alert Toast Banner
+        self.privacy_banner = PrivacyAlertBanner(self)
+        self.privacy_banner.dismissed.connect(self._on_banner_dismissed)
+
         self.media = MediaPlayerPage()
+        self.notification = NotificationPage()
+        self.weather = WeatherPage()
         self.prayer = PrayerPage()
         self.pomo = PomodoroPage()
         self.foot = FootballPage()
         self.system = SystemPage()
         self.todo = TodoPage()
-        self.pages = {"media": self.media, "prayer": self.prayer, "pomodoro": self.pomo,
-                      "football": self.foot, "todo": self.todo, "system": self.system}
+        self.pages = {
+            "media": self.media, "notification": self.notification, "weather": self.weather,
+            "prayer": self.prayer, "pomodoro": self.pomo,
+            "football": self.foot, "todo": self.todo, "system": self.system
+        }
         self.stack = SmoothStackedWidget()
         self.settings_window = None
         left = AppleButton("left", "ghost", 28)
@@ -4013,6 +6888,7 @@ class Island(QWidget):
         self.dots = QLabel(textFormat=Qt.RichText)
         self.dots.setAlignment(Qt.AlignCenter)
         fl.addLayout(header)
+        fl.addWidget(self.privacy_banner)
         fl.addLayout(body, 1)
         fl.addWidget(self.dots)
 
@@ -4052,6 +6928,13 @@ class Island(QWidget):
         self._ambient_anim.setEasingCurve(QEasingCurve.InOutQuad)
         self._ambient_anim.valueChanged.connect(self._on_ambient_step)
 
+        # Dynamic sky surface animation for Immersive Weather
+        self._weather_opacity = 0.0
+        self._weather_anim = QVariantAnimation(self)
+        self._weather_anim.setDuration(260)
+        self._weather_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        self._weather_anim.valueChanged.connect(self._on_weather_step)
+
         # tray icon: native Windows notifications + menu
         self.tray = QSystemTrayIcon(tray_icon(), self)
         self.tray.setToolTip("Island")
@@ -4066,10 +6949,12 @@ class Island(QWidget):
         self._hw_notify_opacity = 0.0
         self._hw_dot_anim_cam = 0.0         # 0→1 scale for dot appear animation
         self._hw_dot_anim_mic = 0.0
-        self.hw_monitor = HardwareMonitor()
+        self.hw_monitor = HardwareMonitor(self)
         self.hw_monitor.camera_changed.connect(self._on_camera)
         self.hw_monitor.mic_changed.connect(self._on_mic)
         self.hw_monitor.charger_changed.connect(self._on_charger)
+        self.hw_monitor.privacy_alert.connect(self._on_privacy_alert)
+        self.hw_monitor.privacy_state.connect(self._on_privacy_state)
         self._hw_notify_timer = QTimer(self)
         self._hw_notify_timer.setSingleShot(True)
         self._hw_notify_timer.setInterval(3500)
@@ -4103,7 +6988,8 @@ class Island(QWidget):
 
     def expanded_size(self):
         w, h = EXPANDED_SIZES[max(0, min(2, CFG["size"]))]
-        return w, h + getattr(self.stack.currentWidget(), "extra_height", 0)
+        banner_h = self.privacy_banner.height() if hasattr(self, "privacy_banner") and self.privacy_banner.isVisible() else 0
+        return w, h + getattr(self.stack.currentWidget(), "extra_height", 0) + banner_h
 
     def rebuild_pages(self):
         """Show the enabled widgets in the order chosen in Settings."""
@@ -4133,6 +7019,19 @@ class Island(QWidget):
         if key in ("city", "country", "method"):
             self.prayer.data = None
             self.prayer_fetcher.fetch(force=True)
+            if hasattr(self, "weather") and hasattr(self.weather, "fetcher"):
+                self.weather.fetcher.fetch()
+        elif key == "weather_unit":
+            if hasattr(self, "weather") and hasattr(self.weather, "fetcher"):
+                self.weather.fetcher.fetch()
+        elif key == "weather_dynamic_gradient":
+            self.sync_ambient_glow(animate=True)
+        elif key in ("notifications_enabled", "notifications_show_badge", "notifications_history_limit"):
+            if hasattr(self, "notification") and hasattr(self.notification, "update_settings"):
+                self.notification.update_settings()
+        elif key in ("lyrics_enabled", "lyrics_layout", "lyrics_click_seek"):
+            if hasattr(self, "media") and hasattr(self.media, "update_lyrics_settings"):
+                self.media.update_lyrics_settings()
         elif key in ("widgets", "tabs"):
             self.rebuild_pages()
         elif key in ("media_ambient_glow", "media_progress_style"):
@@ -4165,6 +7064,12 @@ class Island(QWidget):
             self.system.sample()
         elif key == "start_with_windows":
             set_startup(CFG["start_with_windows"])
+        elif key == "theme":
+            self.apply_theme(CFG.get("theme", "dark"))
+
+    def apply_theme(self, mode):
+        self.theme = mode
+        self.update()
 
     def build_menu(self):
         menu = QMenu()
@@ -4187,9 +7092,8 @@ class Island(QWidget):
     def animate_to(self, size, mode="resize"):
         self.anim.stop()
         if mode == "open":
-            self.anim.setDuration(380)
-            curve = QEasingCurve(QEasingCurve.OutBack)
-            curve.setOvershoot(0.7)
+            self.anim.setDuration(360)
+            curve = QEasingCurve(QEasingCurve.OutCubic)
         elif mode == "close":
             self.anim.setDuration(240)
             curve = QEasingCurve(QEasingCurve.InOutCubic)
@@ -4221,6 +7125,7 @@ class Island(QWidget):
             self.sync_ambient_glow(animate=True)
 
     def collapse(self):
+        self._auto_expanded_for_privacy = False
         if self.todo.is_typing():                     # don't close while you're typing a task
             self.collapse_timer.start(1500)
             return
@@ -4229,6 +7134,8 @@ class Island(QWidget):
             self.full.hide()
             self._ambient_anim.stop()
             self._ambient_opacity = 0.0
+            self._weather_anim.stop()
+            self._weather_opacity = 0.0
             self.animate_to(COLLAPSED, mode="close")
             self.idle_timer.start()
 
@@ -4254,11 +7161,12 @@ class Island(QWidget):
             self.mini.show()
 
     def enterEvent(self, _):
+        self._auto_expanded_for_privacy = False
         self.collapse_timer.stop()
         self.expand()
 
     def leaveEvent(self, _):
-        self.collapse_timer.start(450)
+        self.collapse_timer.start(1200)
 
     def _set_glow(self, v):
         self.alert_glow = float(v)
@@ -4266,6 +7174,10 @@ class Island(QWidget):
 
     def _on_ambient_step(self, v):
         self._ambient_opacity = float(v)
+        self.update()
+
+    def _on_weather_step(self, v):
+        self._weather_opacity = float(v)
         self.update()
 
     def sync_ambient_glow(self, animate=True, target_page=None):
@@ -4282,14 +7194,25 @@ class Island(QWidget):
         if not animate:
             self._ambient_anim.stop()
             self._ambient_opacity = target
-            self.update()
-            return
-
-        if abs(self._ambient_opacity - target) > 0.01:
+        elif abs(self._ambient_opacity - target) > 0.01:
             self._ambient_anim.stop()
             self._ambient_anim.setStartValue(self._ambient_opacity)
             self._ambient_anim.setEndValue(target)
             self._ambient_anim.start()
+
+        # Dynamic sky gradient for Weather page
+        is_weather = self.is_expanded and (target_page is self.weather)
+        target_w = 1.0 if is_weather else 0.0
+        if not animate:
+            self._weather_anim.stop()
+            self._weather_opacity = target_w
+        elif abs(self._weather_opacity - target_w) > 0.01:
+            self._weather_anim.stop()
+            self._weather_anim.setStartValue(self._weather_opacity)
+            self._weather_anim.setEndValue(target_w)
+            self._weather_anim.start()
+
+        self.update()
 
     # --- pages ---
     def go(self, delta, animate=True):
@@ -4424,6 +7347,67 @@ class Island(QWidget):
                                       media_status or live or prayer_text or now.strftime("%a %d %b")))
         self.mini.layout().invalidate()
 
+    # --- Apple Dynamic Island Privacy Alert & Indicator System ---
+    def _on_privacy_alert(self, info):
+        # Stage 1: Live Alert Toast Banner
+        self.privacy_banner.trigger_alert(info)
+        self.privacy_pill.set_state({
+            "camera_active": info.get("has_cam", False) or bool(info.get("cam_apps")),
+            "mic_active": info.get("has_mic", False) or bool(info.get("mic_apps")),
+            "cam_apps": info.get("cam_apps", []),
+            "mic_apps": info.get("mic_apps", [])
+        })
+        self._sync_mini_privacy_dot()
+        if not self.is_expanded:
+            self._auto_expanded_for_privacy = True
+            self.expand()
+        else:
+            self.animate_to(self.expanded_size(), mode="resize")
+
+    def _on_privacy_state(self, info):
+        # Stage 2: Persistent Header Pill updates
+        self.privacy_pill.set_state(info)
+        self._sync_mini_privacy_dot()
+        if not (info.get("camera_active") or info.get("mic_active")):
+            self.privacy_banner.hide_banner()
+            if self.is_expanded:
+                self.animate_to(self.expanded_size(), mode="resize")
+
+    def _sync_mini_privacy_dot(self):
+        cam = getattr(self.privacy_pill, "camera_active", False)
+        mic = getattr(self.privacy_pill, "mic_active", False)
+        if hasattr(self, "eyes"):
+            self.eyes.set_privacy(cam, mic)
+        if hasattr(self, "mini_privacy_dot"):
+            if cam:
+                self.mini_privacy_dot.set_color(QColor("#30D158"))
+            elif mic:
+                self.mini_privacy_dot.set_color(QColor("#FF9F0A"))
+            else:
+                self.mini_privacy_dot.set_color(None)
+
+    def _on_banner_dismissed(self):
+        if getattr(self, "_auto_expanded_for_privacy", False):
+            self._auto_expanded_for_privacy = False
+            if not self.underMouse():
+                self.collapse()
+        elif self.is_expanded:
+            self.animate_to(self.expanded_size(), mode="resize")
+
+    def _toggle_privacy_banner(self):
+        if self.privacy_banner.isVisible() and self.privacy_banner.height() > 0:
+            self.privacy_banner.hide_banner()
+        else:
+            info = {
+                "has_cam": self.privacy_pill.camera_active,
+                "has_mic": self.privacy_pill.mic_active,
+                "cam_apps": self.privacy_pill.cam_apps,
+                "mic_apps": self.privacy_pill.mic_apps
+            }
+            self.privacy_banner.trigger_alert(info)
+        if self.is_expanded:
+            self.animate_to(self.expanded_size(), mode="resize")
+
     # --- hardware indicators & apple notification ---
     def _on_camera(self, active):
         self.camera_active = active
@@ -4533,6 +7517,28 @@ class Island(QWidget):
             p.drawRect(QRectF(0, 0, w, vis_h))
             p.restore()
 
+        # Apple HIG Dynamic Sky Surface for Immersive Weather
+        if self.is_expanded and self._weather_opacity > 0.005:
+            p.save()
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setClipPath(path)
+            is_day = getattr(self.weather, "is_day", True)
+            w_grad = QLinearGradient(0, 0, w, vis_h)
+            if is_day:
+                c1 = QColor("#2B82D9")
+                c2 = QColor("#56AEFF")
+            else:
+                c1 = QColor("#0F172A")
+                c2 = QColor("#1E293B")
+            c1.setAlphaF(self._weather_opacity)
+            c2.setAlphaF(self._weather_opacity)
+            w_grad.setColorAt(0.0, c1)
+            w_grad.setColorAt(1.0, c2)
+            p.setPen(Qt.NoPen)
+            p.setBrush(w_grad)
+            p.drawRect(QRectF(0, 0, w, vis_h))
+            p.restore()
+
         # HIG Dark Mode Craft: 1px inner specular border so rounded corners never look muddy
         if t > 0.2:
             p.save()
@@ -4622,6 +7628,10 @@ class Island(QWidget):
 
 
 if __name__ == "__main__":
+    def _excepthook(exc_type, exc_value, exc_tb):
+        import traceback
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     island = Island()

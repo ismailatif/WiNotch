@@ -1284,7 +1284,7 @@ class Island(QWidget):
             p.drawPath(path)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":n   
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     island = Island()

@@ -6,3 +6,9 @@ scratch/
 .idea/
 .vscode/
 
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+

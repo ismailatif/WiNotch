@@ -1,0 +1,45 @@
+name: Build and Release WinNotch.exe
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Standalone Windows Executable (.exe)
+        run: |
+          pyinstaller --noconsole --onefile --clean --name "WinNotch" --icon "app.ico" island.py
+
+      - name: Create Release and Upload WinNotch.exe
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/WinNotch.exe
+          name: WinNotch ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+

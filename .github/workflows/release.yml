@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  release:
+    types: [published, created]
   workflow_dispatch:
 
 permissions:
@@ -33,13 +35,21 @@ jobs:
         run: |
           pyinstaller --noconsole --onefile --clean --name "WinNotch" --icon "app.ico" island.py
 
-      - name: Create Release and Upload WinNotch.exe
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinNotch-windows
+          path: dist/WinNotch.exe
+
+      - name: Publish to Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         with:
           files: dist/WinNotch.exe
-          name: WinNotch ${{ github.ref_name }}
+          tag_name: ${{ github.event.release.tag_name || github.ref_name || 'v1.0.0' }}
+          name: ${{ github.event.release.name || github.ref_name || 'WinNotch v1.0.0' }}
           draft: false
           prerelease: false
           generate_release_notes: true
+
 

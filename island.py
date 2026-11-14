@@ -39,7 +39,7 @@ from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPen, QFont, QPixmap,
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QHBoxLayout,
                                QVBoxLayout, QStackedWidget, QMenu, QLayout,
                                QGraphicsOpacityEffect, QSizePolicy, QSystemTrayIcon, QFrame,
-                               QLineEdit, QComboBox, QScrollArea, QSpacerItem)
+                               QLineEdit, QComboBox, QScrollArea, QSpacerItem, QCheckBox)
 
 try:
     import winsound
@@ -88,7 +88,7 @@ DEFAULTS = {
     "todos": {str(d): [] for d in range(7)}, "todo_repeat": True, "todo_in_pill": True,
     "disk": "C:\\" if os.name == "nt" else "/",
     "shrink_idle": True, "idle_seconds": 5, "size": 1, "start_with_windows": False,
-    "theme": "dark",
+    "theme": "dark", "onboarding_completed": False,
 }
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Island")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
@@ -5187,8 +5187,18 @@ class SettingsWindow(QWidget):
             Row("Python", QLabel(sys.version.split()[0], objectName="muted")),
             Row("Settings file", QLabel(CONFIG_PATH, objectName="muted")),
         ])
+        self.section(lay, [
+            Row("First-Run Welcome Tour", self.action("Replay Welcome Tour", self.open_welcome_tour))
+        ], "Feature Tour", "Replay the interactive onboarding walkthrough, feature showcase, and permissions agreement.")
         self.section(lay, [self.action("Reset all settings", self.reset, danger=True)],
                      footer="Puts every setting back to its default.")
+
+    def open_welcome_tour(self):
+        if not hasattr(self, "_welcome_window") or self._welcome_window is None:
+            self._welcome_window = WelcomeWindow(self.island)
+        self._welcome_window.show()
+        self._welcome_window.raise_()
+        self._welcome_window.activateWindow()
 
     def reset(self):
         CFG.clear()
@@ -5199,6 +5209,406 @@ class SettingsWindow(QWidget):
             self.island.apply_settings(key)
         self.update_badges()
         self.refresh_page()
+
+
+class OnboardingCard(QFrame):
+    """Frosted Apple-style feature card with icon badge, title, and description."""
+    def __init__(self, icon_col, icon_name, title, desc, parent=None):
+        super().__init__(parent)
+        self.setObjectName("OnboardingCard")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(14)
+
+        tile = IconTile(icon_col, icon_name, size=36)
+        lay.addWidget(tile)
+
+        text_v = QVBoxLayout()
+        text_v.setContentsMargins(0, 0, 0, 0)
+        text_v.setSpacing(2)
+
+        self.t_lbl = QLabel(title)
+        self.t_lbl.setStyleSheet("font-size: 13.5px; font-weight: 700; border: none; background: transparent;")
+        self.d_lbl = QLabel(desc)
+        self.d_lbl.setWordWrap(True)
+        self.d_lbl.setStyleSheet("font-size: 11.5px; border: none; background: transparent;")
+
+        text_v.addWidget(self.t_lbl)
+        text_v.addWidget(self.d_lbl)
+        lay.addLayout(text_v, 1)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        is_light = CFG.get("theme", "dark") == "light"
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QColor(0, 0, 0, 10) if is_light else QColor(255, 255, 255, 12))
+        p.setPen(QPen(QColor(0, 0, 0, 18) if is_light else QColor(255, 255, 255, 22), 1.0))
+        p.drawRoundedRect(r, 12, 12)
+
+        self.t_lbl.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {'#1D1D1F' if is_light else '#FFFFFF'}; border: none; background: transparent;")
+        self.d_lbl.setStyleSheet(f"font-size: 11.5px; color: {'rgba(60, 60, 67, 0.75)' if is_light else 'rgba(255, 255, 255, 0.65)'}; border: none; background: transparent;")
+
+
+class WelcomeWindow(QWidget):
+    """Big-Tech style Onboarding / Welcome Wizard for first-run experience."""
+    def __init__(self, island=None, parent=None):
+        super().__init__(parent)
+        self.island = island
+        self.setFixedSize(680, 560)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        self._build_ui()
+        self._center_on_screen()
+
+    def _center_on_screen(self):
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = (screen.height() - self.height()) // 2
+        self.move(x, y)
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+
+        self.container = QWidget(self)
+        self.container.setObjectName("Container")
+        self.c_layout = QVBoxLayout(self.container)
+        self.c_layout.setContentsMargins(36, 28, 36, 28)
+        self.c_layout.setSpacing(16)
+
+        # Top close button
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addStretch()
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setFixedSize(26, 26)
+        self.btn_close.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.08);
+                color: rgba(255, 255, 255, 0.6);
+                border: none;
+                border-radius: 13px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.16);
+                color: #FFFFFF;
+            }
+        """)
+        self.btn_close.clicked.connect(self.close)
+        top_bar.addWidget(self.btn_close)
+        self.c_layout.addLayout(top_bar)
+
+        # Stacked pages
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._create_page_features())
+        self.stack.addWidget(self._create_page_gestures())
+        self.stack.addWidget(self._create_page_privacy())
+        self.c_layout.addWidget(self.stack, 1)
+
+        # Bottom Bar (Dots + Nav Buttons)
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setContentsMargins(0, 8, 0, 0)
+
+        self.dots_lbl = QLabel()
+        self.dots_lbl.setStyleSheet("border: none; background: transparent;")
+        bottom_bar.addWidget(self.dots_lbl)
+        bottom_bar.addStretch()
+
+        self.btn_back = QPushButton("Back")
+        self.btn_back.setCursor(Qt.PointingHandCursor)
+        self.btn_back.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.08);
+                color: rgba(255, 255, 255, 0.85);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 10px;
+                padding: 8px 18px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.14);
+            }
+        """)
+        self.btn_back.clicked.connect(self._go_back)
+        self.btn_back.hide()
+        bottom_bar.addWidget(self.btn_back)
+
+        self.btn_next = QPushButton("Continue")
+        self.btn_next.setCursor(Qt.PointingHandCursor)
+        self.btn_next.setStyleSheet("""
+            QPushButton {
+                background: #0A84FF;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 24px;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background: #0071E3;
+            }
+            QPushButton:disabled {
+                background: rgba(255, 255, 255, 0.10);
+                color: rgba(255, 255, 255, 0.30);
+            }
+        """)
+        self.btn_next.clicked.connect(self._go_next)
+        bottom_bar.addWidget(self.btn_next)
+
+        self.c_layout.addLayout(bottom_bar)
+        root.addWidget(self.container)
+        self._update_dots()
+
+    def _create_page_features(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        # Header with AppIcon
+        h_box = QHBoxLayout()
+        h_box.setSpacing(14)
+        icon = AppIcon(52)
+        h_box.addWidget(icon)
+
+        title_v = QVBoxLayout()
+        title_v.setSpacing(2)
+        self.title_1 = QLabel("Welcome to WinNotch")
+        self.title_1.setStyleSheet("font-size: 22px; font-weight: 800; color: #FFFFFF; border: none; background: transparent;")
+        self.sub_1 = QLabel("The living, interactive Dynamic Island experience crafted for Windows 10 & 11.")
+        self.sub_1.setStyleSheet("font-size: 12px; color: rgba(255, 255, 255, 0.65); border: none; background: transparent;")
+        title_v.addWidget(self.title_1)
+        title_v.addWidget(self.sub_1)
+        h_box.addLayout(title_v, 1)
+        lay.addLayout(h_box)
+        lay.addSpacing(6)
+
+        # 3 Feature Cards
+        lay.addWidget(OnboardingCard(
+            "#30D158", "eye",
+            "Living Notch & Interactive Eyes",
+            "Minimalist capsules look at your cursor with 3D parallax tracking, blinks, playful expressions, and camera/mic privacy lights."
+        ))
+        lay.addWidget(OnboardingCard(
+            "#BF5AF2", "music",
+            "Universal Media & Synced Lyrics",
+            "Full Spotify, YouTube & Apple Music controls with real-time karaoke lyrics from LRCLIB and silky ambient album glow."
+        ))
+        lay.addWidget(OnboardingCard(
+            "#0A84FF", "bell",
+            "Live Windows Notification Center",
+            "Direct real-time notification alerts from WhatsApp, Chrome, and Outlook with unread badge counters and frosted cards."
+        ))
+        lay.addStretch()
+        return page
+
+    def _create_page_gestures(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        self.title_2 = QLabel("Gestures & Controls")
+        self.title_2.setStyleSheet("font-size: 22px; font-weight: 800; color: #FFFFFF; border: none; background: transparent;")
+        self.sub_2 = QLabel("Master the effortless micro-interactions right from the top of your screen.")
+        self.sub_2.setStyleSheet("font-size: 12px; color: rgba(255, 255, 255, 0.65); border: none; background: transparent;")
+        lay.addWidget(self.title_2)
+        lay.addWidget(self.sub_2)
+        lay.addSpacing(6)
+
+        lay.addWidget(OnboardingCard(
+            "#FF9F0A", "timer",
+            "Hover to Expand",
+            "Simply move your mouse cursor over the notch to expand full widgets. Move away to let it collapse automatically."
+        ))
+        lay.addWidget(OnboardingCard(
+            "#56AEFF", "cloud",
+            "Mouse Wheel to Glide Between Pages",
+            "Scroll your mouse wheel or click arrow buttons to glide smoothly between Media, Weather, Notifications, Prayer Times, and System."
+        ))
+        lay.addWidget(OnboardingCard(
+            "#5E5CE6", "chip",
+            "Right-Click for Settings",
+            "Click the gear icon or right-click the notch anytime to customize themes, active modules, layout size, and shortcuts."
+        ))
+        lay.addStretch()
+        return page
+
+    def _create_page_privacy(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        self.title_3 = QLabel("Privacy & Agreement")
+        self.title_3.setStyleSheet("font-size: 22px; font-weight: 800; color: #FFFFFF; border: none; background: transparent;")
+        self.sub_3 = QLabel("Your data never leaves your device. 100% offline, local execution.")
+        self.sub_3.setStyleSheet("font-size: 12px; color: rgba(255, 255, 255, 0.65); border: none; background: transparent;")
+        lay.addWidget(self.title_3)
+        lay.addWidget(self.sub_3)
+        lay.addSpacing(6)
+
+        lay.addWidget(OnboardingCard(
+            "#30D158", "chip",
+            "100% Local Processing",
+            "Hardware sensor checks (camera/mic dots) and toast notifications run strictly on your machine. Zero tracking or telemetry."
+        ))
+        lay.addWidget(OnboardingCard(
+            "#0A84FF", "info",
+            "Open-Source Freedom (MIT License)",
+            "WinNotch is free, transparent, and open-source. Your personal data is never stored on external servers or sold."
+        ))
+
+        # Personalization row
+        opt_frame = QFrame()
+        opt_lay = QHBoxLayout(opt_frame)
+        opt_lay.setContentsMargins(14, 8, 14, 8)
+        opt_lay.setSpacing(12)
+
+        self.th_lbl = QLabel("Appearance Theme:")
+        self.th_lbl.setStyleSheet("color: #FFFFFF; font-size: 12px; font-weight: 600; border: none; background: transparent;")
+        self.seg_theme = Segmented(["Dark Mode", "Light Mode"], width=200)
+        self.seg_theme.index = self.seg_theme.pos = 0 if CFG.get("theme", "dark") == "dark" else 1
+        opt_lay.addWidget(self.th_lbl)
+        opt_lay.addWidget(self.seg_theme)
+        opt_lay.addStretch()
+
+        self.chk_startup = QCheckBox("Start on Windows Login")
+        self.chk_startup.setChecked(CFG.get("start_with_windows", False))
+        self.chk_startup.setStyleSheet("color: rgba(255,255,255,0.85); font-size: 12px; border: none; background: transparent;")
+        opt_lay.addWidget(self.chk_startup)
+        lay.addWidget(opt_frame)
+
+        # Agreement Checkbox
+        agree_box = QFrame()
+        agree_l = QHBoxLayout(agree_box)
+        agree_l.setContentsMargins(12, 8, 12, 8)
+        agree_l.setSpacing(10)
+
+        self.chk_agree = QCheckBox("I agree to the Terms of Service, MIT Open-Source License, and Privacy Guidelines.")
+        self.chk_agree.setCursor(Qt.PointingHandCursor)
+        self.chk_agree.setStyleSheet("""
+            QCheckBox {
+                color: #FFFFFF;
+                font-size: 12px;
+                font-weight: 600;
+                border: none;
+                background: transparent;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid rgba(255, 255, 255, 0.4);
+                background: rgba(255, 255, 255, 0.1);
+            }
+            QCheckBox::indicator:checked {
+                background: #0A84FF;
+                border-color: #0A84FF;
+            }
+        """)
+        self.chk_agree.toggled.connect(self._on_agree_toggled)
+        agree_l.addWidget(self.chk_agree)
+        lay.addWidget(agree_box)
+        lay.addStretch()
+        return page
+
+    def _on_agree_toggled(self, checked):
+        if self.stack.currentIndex() == 2:
+            self.btn_next.setEnabled(checked)
+
+    def _update_dots(self):
+        idx = self.stack.currentIndex()
+        total = self.stack.count()
+        dots = []
+        for i in range(total):
+            col = "#0A84FF" if i == idx else "rgba(255, 255, 255, 0.25)"
+            dots.append(f"<span style='color: {col}; font-size: 14px;'>●</span>")
+        self.dots_lbl.setText("&nbsp;&nbsp;".join(dots))
+
+        self.btn_back.setVisible(idx > 0)
+        if idx == total - 1:
+            self.btn_next.setText("Get Started")
+            self.btn_next.setEnabled(self.chk_agree.isChecked())
+        else:
+            self.btn_next.setText("Continue")
+            self.btn_next.setEnabled(True)
+
+    def _go_next(self):
+        idx = self.stack.currentIndex()
+        if idx < self.stack.count() - 1:
+            self.stack.setCurrentIndex(idx + 1)
+            self._update_dots()
+        else:
+            self._finish()
+
+    def _go_back(self):
+        idx = self.stack.currentIndex()
+        if idx > 0:
+            self.stack.setCurrentIndex(idx - 1)
+            self._update_dots()
+
+    def _finish(self):
+        CFG["onboarding_completed"] = True
+        CFG["theme"] = "dark" if self.seg_theme.index == 0 else "light"
+        CFG["start_with_windows"] = self.chk_startup.isChecked()
+        save_config()
+        self.close()
+        if self.island:
+            self.island.apply_settings("theme")
+            self.island.expand()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        is_light = CFG.get("theme", "dark") == "light"
+        r = QRectF(self.rect()).adjusted(12, 12, -12, -12)
+
+        # Apple Acrylic Frosted Background
+        p.setPen(QPen(QColor(0, 0, 0, 20) if is_light else QColor(255, 255, 255, 30), 1.0))
+        p.setBrush(QColor("#F5F5F7" if is_light else "#18181B"))
+        p.drawRoundedRect(r, 20, 20)
+
+        t_col = "#1D1D1F" if is_light else "#FFFFFF"
+        sub_col = "rgba(60, 60, 67, 0.75)" if is_light else "rgba(255, 255, 255, 0.65)"
+        if hasattr(self, "title_1"):
+            self.title_1.setStyleSheet(f"font-size: 22px; font-weight: 800; color: {t_col}; border: none; background: transparent;")
+            self.sub_1.setStyleSheet(f"font-size: 12px; color: {sub_col}; border: none; background: transparent;")
+        if hasattr(self, "title_2"):
+            self.title_2.setStyleSheet(f"font-size: 22px; font-weight: 800; color: {t_col}; border: none; background: transparent;")
+            self.sub_2.setStyleSheet(f"font-size: 12px; color: {sub_col}; border: none; background: transparent;")
+        if hasattr(self, "title_3"):
+            self.title_3.setStyleSheet(f"font-size: 22px; font-weight: 800; color: {t_col}; border: none; background: transparent;")
+            self.sub_3.setStyleSheet(f"font-size: 12px; color: {sub_col}; border: none; background: transparent;")
+            self.th_lbl.setStyleSheet(f"color: {t_col}; font-size: 12px; font-weight: 600; border: none; background: transparent;")
+            self.chk_startup.setStyleSheet(f"color: {t_col}; font-size: 12px; border: none; background: transparent;")
+            self.chk_agree.setStyleSheet(f"""
+                QCheckBox {{
+                    color: {t_col};
+                    font-size: 12px;
+                    font-weight: 600;
+                    border: none;
+                    background: transparent;
+                }}
+                QCheckBox::indicator {{
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 4px;
+                    border: 1px solid {'rgba(0,0,0,0.3)' if is_light else 'rgba(255,255,255,0.4)'};
+                    background: {'rgba(0,0,0,0.06)' if is_light else 'rgba(255,255,255,0.1)'};
+                }}
+                QCheckBox::indicator:checked {{
+                    background: #0A84FF;
+                    border-color: #0A84FF;
+                }}
+            """)
 
 
 # ======================= the island window =======================
@@ -7636,4 +8046,7 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)
     island = Island()
     island.show()
+    if not CFG.get("onboarding_completed", False):
+        welcome = WelcomeWindow(island)
+        welcome.show()
     sys.exit(app.exec())
